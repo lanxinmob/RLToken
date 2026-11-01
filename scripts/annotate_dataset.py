@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Interactive critical-phase annotation tool for a LeRobot teleop dataset.
 
-Decodes the dataset's videos with PyAV (handles AV1/libsvtav1, which OpenCV's
-VideoCapture often cannot). Two annotation modes, auto-selected:
+Reads image datasets directly from parquet, or decodes videos with PyAV
+(including AV1/libsvtav1). Two annotation modes, auto-selected:
 
 1. GUI mode (default when a display is present; tkinter, no OpenCV GUI needed):
-   plays the episode's top-camera video and marks intervals with the keyboard:
+   displays the episode's cameras and marks intervals with the keyboard:
        s        mark interval START at the current frame
        e        mark interval END at the current frame (appends [start, end])
        u        undo the last interval
@@ -52,10 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--annotations_out", type=str, required=True,
                         help="JSON output path (incremental: existing intervals are kept).")
-    parser.add_argument("--camera", type=str, default="observation.images.top",
-                        help="Camera used for contact-sheet mode (GUI mode shows all cameras side by side).")
-    parser.add_argument("--fps", type=float, default=30.0,
-                        help="Dataset frame rate (used to compute episode offsets in shared videos).")
+    parser.add_argument("--camera", type=str, default=None,
+                        help="Camera feature to show (default: all cameras in GUI, first in contact sheets).")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Override the dataset frame rate from meta/info.json.")
+    parser.add_argument("--start_paused", action="store_true",
+                        help="Pause at the first frame of each episode until space is pressed.")
     parser.add_argument("--force_sheet", action="store_true",
                         help="Force contact-sheet mode even if a display is available.")
     parser.add_argument("--sheet_dir", type=str, default="annotation_sheets",
@@ -88,6 +90,7 @@ def save_annotations(path: Path, annotations: dict[int, list[tuple[int, int]]]) 
             for start, end in annotations[episode]
         ]
     }
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     with open(tmp, "w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2)
@@ -97,12 +100,15 @@ def save_annotations(path: Path, annotations: dict[int, list[tuple[int, int]]]) 
                 len(payload["annotations"]), len(annotations), path)
 
 
-def episode_video_paths(
+def episode_frame_sources(
     dataset_path: Path,
     fps: float,
-    cameras: tuple[str, ...] = ("observation.images.top", "observation.images.wrist"),
+    cameras: tuple[str, ...],
 ) -> list[tuple[int, dict[str, tuple[Path, int]], int]]:
-    """Return [(episode_index, {camera: (video_path, start_frame)}, length)].
+    """Return episode camera sources and lengths.
+
+    Each source is (path, offset): a video and its first frame, or a parquet
+    file and the episode index used to select its embedded image rows.
 
     Newer LeRobot metadata (0.5.x) stores per-episode video references as
     ``videos/<feature>/chunk_index`` + ``file_index``; several episodes share
@@ -113,13 +119,14 @@ def episode_video_paths(
     so each camera gets its OWN start_frame. Missing cameras (no parquet
     columns / missing file) are omitted from the dict.
     """
-    from datasets import Dataset
+    import pyarrow.parquet as pq
 
     episodes_dir = dataset_path / "meta" / "episodes"
     parquet_files = sorted(episodes_dir.glob("**/*.parquet"))
     if not parquet_files:
         raise FileNotFoundError(f"No episodes parquet under {episodes_dir}")
-    episodes = Dataset.from_parquet([str(path) for path in parquet_files])
+    episodes = pq.read_table(parquet_files).to_pylist()
+    info = json.loads((dataset_path / "meta" / "info.json").read_text())
 
     videos_dir = dataset_path / "videos"
     result: list[tuple[int, dict[str, tuple[Path, int]], int]] = []
@@ -128,6 +135,15 @@ def episode_video_paths(
         length = int(row["length"])
         paths: dict[str, tuple[Path, int]] = {}
         for cam in cameras:
+            if info["features"][cam]["dtype"] == "image":
+                data_path = dataset_path / info["data_path"].format(
+                    chunk_index=int(row["data/chunk_index"]),
+                    file_index=int(row["data/file_index"]),
+                )
+                if not data_path.is_file():
+                    raise FileNotFoundError(data_path)
+                paths[cam] = (data_path, episode_index)
+                continue
             try:
                 chunk_index = int(row[f"videos/{cam}/chunk_index"])
                 file_index = int(row[f"videos/{cam}/file_index"])
@@ -142,7 +158,7 @@ def episode_video_paths(
                 paths[cam] = (video_path, start_frame)
         if not paths:
             raise FileNotFoundError(
-                f"Episode {episode_index}: no video files found for cameras {cameras}"
+                f"Episode {episode_index}: no image or video sources found for cameras {cameras}"
             )
         result.append((episode_index, paths, length))
     return sorted(result, key=lambda item: item[0])
@@ -157,30 +173,6 @@ def _seek_to_frame(container, stream, target_frame: int, fps: float) -> None:
     """
     offset = int(max(0, target_frame) * (1.0 / fps) / float(stream.time_base))
     container.seek(offset, stream=stream)
-
-
-def iter_episode_frames(video_path: Path, start_frame: int, length: int, fps: float):
-    """Yield (episode_local_frame, bgr24 ndarray) for an episode's frames (PyAV)."""
-    import av
-
-    container = av.open(str(video_path))
-    stream = container.streams.video[0]
-    # Seek a little before the episode start (keyframe-aligned), then decode
-    # forward, skipping frames until the episode's first frame.
-    _seek_to_frame(container, stream, max(0, start_frame - 10), fps)
-    try:
-        for frame in container.decode(stream):
-            if frame.pts is not None:
-                seconds = float(frame.pts * stream.time_base)
-                frame_no = int(round(seconds * fps))
-            else:
-                frame_no = -1  # unknown; caller falls back to counting
-            if frame_no >= start_frame + length:
-                break
-            if frame_no >= start_frame:
-                yield frame_no - start_frame, frame.to_ndarray(format="bgr24")
-    finally:
-        container.close()
 
 
 class EpisodeFrameReader:
@@ -254,6 +246,58 @@ class EpisodeFrameReader:
             self._container = None
 
 
+class EpisodeImageReader:
+    """Read one episode's image column without loading other episodes or cameras."""
+
+    def __init__(self, path: Path, episode: int, length: int, camera: str):
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(
+            path, columns=["frame_index", camera],
+            filters=[("episode_index", "=", episode)],
+        ).sort_by("frame_index")
+        if table["frame_index"].to_pylist() != list(range(length)):
+            raise ValueError(f"Episode {episode}: image frame indices do not match length {length}")
+        self._images = table[camera].to_pylist()
+        self._root = path.parents[2]
+        self._camera = camera
+        self._episode = episode
+        self._current_frame = -1
+        self._last_image = None
+
+    def read(self, episode_frame: int):
+        if not 0 <= episode_frame < len(self._images):
+            return None
+        if episode_frame == self._current_frame:
+            return self._last_image
+        entry = self._images[episode_frame]
+        if entry.get("bytes") is not None:
+            image = cv2.imdecode(np.frombuffer(entry["bytes"], dtype=np.uint8), cv2.IMREAD_COLOR)
+        else:
+            path = Path(entry["path"])
+            if not path.is_absolute():
+                candidate = self._root / path
+                path = candidate if candidate.is_file() else (
+                    self._root / "images" / self._camera / f"episode-{self._episode:06d}" / path
+                )
+            image = cv2.imread(str(path))
+        if image is None:
+            raise ValueError(f"Episode {self._episode}: cannot decode {self._camera} frame {episode_frame}")
+        self._current_frame = episode_frame
+        self._last_image = image
+        return image
+
+    def close(self) -> None:
+        self._images.clear()
+        self._last_image = None
+
+
+def open_frame_reader(path: Path, offset: int, length: int, fps: float, camera: str):
+    if path.suffix == ".parquet":
+        return EpisodeImageReader(path, offset, length, camera)
+    return EpisodeFrameReader(path, offset, length, fps)
+
+
 def gui_available() -> bool:
     """Tkinter-based GUI works whenever a display is present (no OpenCV GUI needed)."""
     try:
@@ -276,7 +320,8 @@ class _TkAnnotator:
     DISPLAY_W = 480   # displayed width per camera (source 640x480)
     DISPLAY_H = 360
 
-    def __init__(self, readers: dict[str, EpisodeFrameReader], episode: int, length: int):
+    def __init__(self, readers: dict[str, EpisodeFrameReader | EpisodeImageReader],
+                 episode: int, length: int, *, start_paused: bool = False):
         import tkinter as tk
 
         from PIL import Image, ImageTk
@@ -286,7 +331,7 @@ class _TkAnnotator:
         self.episode = episode
         self.length = length
         self.frame = 0
-        self.paused = False
+        self.paused = start_paused
         self.start_mark: int | None = None
         self.intervals: list[tuple[int, int]] = []
         self.quit_all = False
@@ -420,6 +465,8 @@ def annotate_episode_gui(
     video_infos: dict[str, tuple[Path, int]],
     length: int,
     fps: float,
+    *,
+    start_paused: bool = False,
 ) -> tuple[list[tuple[int, int]], bool]:
     """Play the episode in a tkinter window (all cameras side by side).
 
@@ -427,14 +474,14 @@ def annotate_episode_gui(
     cameras can roll to new files at different times.
     """
     readers = {
-        camera: EpisodeFrameReader(path, start_frame, length, fps)
+        camera: open_frame_reader(path, start_frame, length, fps, camera)
         for camera, (path, start_frame) in video_infos.items()
     }
     print(f"\n=== Episode {episode} | {length} frames | cameras: {', '.join(video_infos)} ===")
     print("Keys: s=interval START  e=interval END  u=undo  space=pause  "
           "←/→=1 frame  Shift+←/→=±30  n=next  q=quit")
     try:
-        annotator = _TkAnnotator(readers, episode, length)
+        annotator = _TkAnnotator(readers, episode, length, start_paused=start_paused)
         return annotator.run()
     finally:
         for reader in readers.values():
@@ -449,6 +496,7 @@ def render_contact_sheet(
     *,
     cols: int,
     thumb_width: int,
+    camera: str,
 ) -> np.ndarray:
     """Render one episode as a montage of thumbnails labelled with frame numbers."""
     thumb_height = int(thumb_width * 3 / 4)
@@ -456,15 +504,22 @@ def render_contact_sheet(
     cell_w, cell_h = thumb_width, thumb_height + label_height
     rows = (length + cols - 1) // cols
     sheet = np.full((rows * cell_h, cols * cell_w, 3), 30, dtype=np.uint8)
-    for episode_frame, image in iter_episode_frames(video_path, start_frame, length, fps):
-        col = episode_frame % cols
-        row = episode_frame // cols
-        thumb = cv2.resize(image, (thumb_width, thumb_height))
-        y0 = row * cell_h + label_height
-        x0 = col * cell_w
-        sheet[y0:y0 + thumb_height, x0:x0 + thumb_width] = thumb
-        cv2.putText(sheet, f"{episode_frame}", (x0 + 2, y0 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    reader = open_frame_reader(video_path, start_frame, length, fps, camera)
+    try:
+        for episode_frame in range(length):
+            image = reader.read(episode_frame)
+            if image is None:
+                raise ValueError(f"Cannot read {camera} frame {episode_frame} from {video_path}")
+            col = episode_frame % cols
+            row = episode_frame // cols
+            thumb = cv2.resize(image, (thumb_width, thumb_height))
+            y0 = row * cell_h + label_height
+            x0 = col * cell_w
+            sheet[y0:y0 + thumb_height, x0:x0 + thumb_width] = thumb
+            cv2.putText(sheet, f"{episode_frame}", (x0 + 2, y0 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    finally:
+        reader.close()
     return sheet
 
 
@@ -478,6 +533,7 @@ def annotate_episode_sheet(
     sheet_dir: Path,
     cols: int,
     thumb_width: int,
+    camera: str,
 ) -> tuple[list[tuple[int, int]], bool]:
     """Render a contact sheet, then collect intervals from terminal input.
 
@@ -486,7 +542,7 @@ def annotate_episode_sheet(
     sheet_dir.mkdir(parents=True, exist_ok=True)
     sheet_path = sheet_dir / f"episode_{episode:04d}.png"
     sheet = render_contact_sheet(video_path, start_frame, length, fps,
-                                 cols=cols, thumb_width=thumb_width)
+                                 cols=cols, thumb_width=thumb_width, camera=camera)
     cv2.imwrite(str(sheet_path), sheet)
     print(f"\n=== Episode {episode} | {length} frames | sheet: {sheet_path} ===")
     print("Open the sheet image and enter critical-phase intervals.")
@@ -534,11 +590,25 @@ def main() -> None:
     if annotations:
         logger.info("Loaded %d previously annotated episodes; they will be skipped.", len(annotations))
 
-    episodes = episode_video_paths(dataset_path, args.fps)
+    info = json.loads((dataset_path / "meta" / "info.json").read_text())
+    fps = args.fps if args.fps is not None else float(info["fps"])
+    if fps <= 0:
+        raise ValueError("Frame rate must be positive")
+    cameras = tuple(key for key, feature in info["features"].items()
+                    if feature["dtype"] in ("image", "video"))
+    if args.camera is not None:
+        if args.camera not in cameras:
+            raise ValueError(f"Unknown camera {args.camera!r}; available cameras: {cameras}")
+        cameras = (args.camera,)
+    if not cameras:
+        raise ValueError("Dataset has no image or video features")
+    episodes = episode_frame_sources(dataset_path, fps, cameras)
     logger.info("Found %d episodes in %s", len(episodes), dataset_path)
 
     use_gui = not args.force_sheet and gui_available()
     logger.info("Annotation mode: %s", "GUI playback (tkinter)" if use_gui else "contact-sheet (headless)")
+    if not out_path.exists():
+        save_annotations(out_path, annotations)
 
     try:
         for episode, video_infos, length in episodes:
@@ -547,22 +617,24 @@ def main() -> None:
                 continue
             if use_gui:
                 intervals, should_quit = annotate_episode_gui(
-                    episode, video_infos, length, args.fps,
+                    episode, video_infos, length, fps, start_paused=args.start_paused,
                 )
             else:
-                sheet_info = video_infos.get(args.camera)
+                camera = args.camera or cameras[0]
+                sheet_info = video_infos.get(camera)
                 if sheet_info is None:
                     logger.warning(
                         "Episode %d: camera %s unavailable (have %s); skipping.",
-                        episode, args.camera, sorted(video_infos),
+                        episode, camera, sorted(video_infos),
                     )
                     continue
                 sheet_video, sheet_start = sheet_info
                 intervals, should_quit = annotate_episode_sheet(
-                    episode, sheet_video, sheet_start, length, args.fps,
+                    episode, sheet_video, sheet_start, length, fps,
                     sheet_dir=Path(args.sheet_dir),
                     cols=args.sheet_cols,
                     thumb_width=args.thumb_width,
+                    camera=camera,
                 )
             if intervals:
                 annotations[episode] = intervals

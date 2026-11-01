@@ -39,8 +39,8 @@ python scripts/infer_rlt_stage2_pi05.py --config configs/infer_pi05.json
   `--auto_critical false`, so a key like `"dry_run": false` is simply the default. Paired flags
   (`record_dataset`, `rtc_enabled`, `leader_mirror`) accept `true` or `false` in the file and
   `--no-...` on the command line.
-- Four keys hold JSON text rather than plain values: `cameras`, `camera_map`,
-  `max_relative_target` and `actor_max_relative_target`.
+- Three keys hold JSON text rather than plain values: `cameras`, `camera_map` and
+  `max_relative_target`.
 
 Only `pi05_path` and `rlt_checkpoint` are mandatory. Everything else has a working default, and
 the values that follow the defaults can be deleted from a config without changing a run.
@@ -104,7 +104,7 @@ the values that follow the defaults can be deleted from a config without changin
 | `actor_execution_scale` | `1.0` | Scale applied to actor actions before execution. `0.5` halves the speed and spreads the task over more steps. |
 | `actor_execute_mean` | off | Execute the actor's mean action without sampling, which removes the sampling jitter. |
 | `actor_noise_std` | `0.0` | Exploration noise added on top of that mean, in normalized action space. |
-| `actor_max_relative_target` | none | Per-step per-joint limit in degrees applied only to actor actions, relative to the last commanded pose. VLA and human actions are not clamped. |
+| `actor_max_relative_target` | disabled | Actor-only relative clipping is rejected. ARX Stage 2 applies one shared EMA, speed and workspace execution contract to every policy target. |
 | `actor_critical_delay_steps` | `15` | Consecutive critical-phase control steps required before the actor may take over. |
 | `rtc_enabled` | on | Pi0.5 real-time chunking: the previous chunk guides the new one, which removes the pause between replans. |
 | `rtc_execution_horizon` | `10` | Actions executed between two Pi0.5 replans. It has to match the RL horizon and `n_action_steps_rl`. |

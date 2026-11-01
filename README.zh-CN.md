@@ -1,3 +1,5 @@
+> 本机 ARX5 鼠标任务：RLT 在本仓库运行，π0.5 基线在 `../pi05`。启动、产物和接管操作见 [ARX5_README.md](ARX5_README.md)，交接状态见 [HANDOFF.md](HANDOFF.md)。
+
 <h1 align="center">RL-Token-Pi05</h1>
 
 <p align="center">
@@ -206,6 +208,10 @@ python scripts/train_rlt_stage1_pi05.py \
 一集结束后写入 `--annotations_out`，退出时还会再写一次，因此随时可以中断再继续，文件里
 已经有的集会自动跳过。
 
+工具支持视频和 parquet 内嵌图片，自动读取数据集的相机名称与帧率。
+用 `--camera observation.images.cam_wrist` 可以指定单路相机；添加 `--start_paused`
+会在每集第一帧暂停，按空格开始播放。
+
 <p align="center">
   <img src="assets/annotate_tool_gui.png" alt="标注工具：两块相机画面与已标出的区间" width="780">
 </p>
@@ -232,15 +238,15 @@ python scripts/annotate_dataset.py \
   --dataset_path /path/to/lerobot/insert_bolt \
   --annotations_out annotations_bolt.json
 
-# 2. 计算采样帧的 z_rl
+# 2. 复用完整 Stage 1 缓存，计算已标注回合每一帧的 z_rl
 python scripts/precompute_critical_zrl.py \
+  --cache_path outputs/pi05_bolt_embeddings \
   --pi05_path /path/to/pi05_bolt/checkpoints/030000/pretrained_model \
-  --tokenizer_path /path/to/paligemma_tokenizer \
   --rlt_checkpoint outputs/rlt_stage1_bolt/best_checkpoint.pt \
   --dataset_path /path/to/lerobot/insert_bolt \
   --annotations annotations_bolt.json \
   --output outputs/critical_zrl_bolt.npz \
-  --pos_per_interval 40 --neg_per_episode 120 --batch_size 8 --device cuda
+  --all_frames --batch_size 32 --device cuda
 
 # 3. 训练分类器
 python scripts/train_critical_classifier.py \
@@ -253,19 +259,19 @@ python scripts/train_critical_classifier.py \
 python scripts/evaluate_critical_classifier.py \
   --precomputed_zrl outputs/critical_zrl_bolt.npz \
   --classifier outputs/critical_classifier_bolt.pt --val_episodes 6 \
-  --threshold_on 0.75 --threshold_off 0.45 --smooth_steps 4 --device cuda
-
-# 5. 画出可视化核验图
-python scripts/visualize_critical_classifier.py \
-  --precomputed_zrl outputs/critical_zrl_bolt.npz \
-  --classifier outputs/critical_classifier_bolt.pt \
-  --out_dir outputs/critical_vis --mode both \
-  --dataset /path/to/lerobot/insert_bolt --annotations annotations_bolt.json \
-  --episodes 0-11 --cam top --device cuda
+  --threshold_on 0.75 --threshold_off 0.45 --smooth_steps 4 --device cuda \
+  --frame_stride 10 --output outputs/critical_evaluation_bolt.json
 ```
 
-核验图会写出两类文件：`prob_timeline.png` 每个回合一条概率曲线并标出人工标注区间，`sheet_XX.png` 是各
-区间边界帧的拼图，每帧下方标注分类概率。下图即其中一张拼图，裁切保留前两行。
+`--cache_path` 使用训练该 Stage 1 权重时的完整、未分片图像 prefix 缓存。脚本会核对数据集、
+VLA 和 checkpoint 的来源，并保留数据集的完整本体状态，包括夹爪。`--all_frames` 包含已标注
+回合的每一帧，便于连续区间评估。前 `--val_episodes` 个已标注回合完整保留作验证；状态归一化
+仅使用训练回合。分类器权重中会保存数据划分、随机种子、最佳轮次和训练曲线数据。
+
+评估分别报告训练集、验证集的原始分类指标与运行时检测器指标，以及区间 IoU 和边界延迟。
+`--frame_stride 10` 模拟每 10 帧动作块更新一次检测器，其间保持上次判断；请与 Stage 2 的动作块
+长度一致。默认步长为 1，即逐帧评估。省略 `--val_episodes` 时读取分类器保存的验证集；显式
+指定的划分必须与权重中的记录一致。
 
 <p align="center">
   <img src="assets/critical_phase_classifier_check.jpg" alt="关键阶段分类器核验" width="780">
@@ -314,8 +320,9 @@ python scripts/train_rlt_stage2_pi05.py --config configs/stage2_pi05.json
 | `e` / `q` | 急停 / 退出 |
 | `y` / `n` | 弹窗提示时判定成功 / 失败 |
 
-一次带人工介入的回合大致如下：回合开始后按一次 `a` 启用 Actor（该状态跨回合保持），关键阶段处于
-激活状态时 Actor 才会接管，关键阶段由分类器（`--auto_critical`）或手动按 `c` 决定；策略运行期间
+使用 `--auto_critical` 训练时默认允许 Actor，通过 warmup、更新次数和关键阶段延迟门控后自动接管，
+无需先按 `a`；`a` 用于禁止或重新允许，手动禁止跨回合保持。手动模式仍需 `c` 标记关键阶段、
+`a` 允许 Actor。策略运行期间
 主臂跟随从臂，两条臂一起运动。发现策略即将失败时按 `h` 切换到人工控制，从臂从当前位姿开始跟随
 主臂，因此修正动作不会出现跳变；再按一次 `h` 或按 `s` 把控制交还策略；按 `f` 在当前动作块结束后
 结束本回合，随后在 y/n 提示中判定成败，下一回合随之开始。介入过程会作为修正动作保留，成败在回合

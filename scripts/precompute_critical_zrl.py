@@ -8,7 +8,7 @@ frozen Stage 1 RLT encoder to produce one z_rl per sampled frame.
 
 Output NPZ (consumed by ``train_critical_classifier.py --precomputed_zrl``):
     z_rl      (N, rlt_hidden_dim) float16
-    proprio   (N, 6) float32
+    proprio   (N, dataset_state_dim) float32
     labels    (N,) int64 (1 = critical phase)
     episode   (N,) int64
     frame     (N,) int64 (frame index within episode)
@@ -26,6 +26,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
+import hashlib
 import json
 import logging
 import sys
@@ -45,8 +47,12 @@ from train_critical_classifier import load_annotations, sample_dataset_frames  #
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pi05_path", type=str, required=True)
-    parser.add_argument("--tokenizer_path", type=str, required=True)
+    parser.add_argument("--pi05_path", type=str, default=None)
+    parser.add_argument("--tokenizer_path", type=str, default=None)
+    parser.add_argument("--cache_path", type=str, default=None,
+                        help="Reuse the matching Stage 1 prefix cache instead of running the VLA.")
+    parser.add_argument("--all_frames", action="store_true",
+                        help="With --cache_path, encode every frame in annotated episodes for temporal evaluation.")
     parser.add_argument("--rlt_checkpoint", type=str, required=True)
     parser.add_argument("--dataset_path", type=str, required=True)
     parser.add_argument("--annotations", type=str, required=True)
@@ -59,12 +65,136 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def precompute_from_cache(args: argparse.Namespace, annotations: dict, device: torch.device) -> None:
+    """Encode a verified full-dataset Stage 1 cache, preserving native state dimensions."""
+    import pyarrow.parquet as pq
+
+    from lerobot.policies.pi05_rlt.configuration_pi05_rlt import PI05RLTConfig
+    from lerobot.policies.pi05_rlt.modeling_pi05_rlt import RLTokenEncoder
+
+    cache = Path(args.cache_path).resolve()
+    dataset = Path(args.dataset_path).resolve()
+    meta = json.loads((cache / "meta.json").read_text())
+    required = {"schema_version": 2, "complete": True, "image_only": True,
+                "embedding_stage": "post_transformer", "language_positions_dropped": True,
+                "dtype": "float16", "has_mask": True}
+    for key, expected in required.items():
+        if meta.get(key) != expected:
+            raise ValueError(f"Cache {key} must be {expected!r}, got {meta.get(key)!r}")
+    if Path(meta["dataset_repo_id"]).resolve() != dataset:
+        raise ValueError("Embedding cache belongs to a different dataset")
+    if args.pi05_path and Path(meta["pi05_path"]).resolve() != Path(args.pi05_path).resolve():
+        raise ValueError("Embedding cache belongs to a different VLA")
+    paths = sorted((dataset / "data").rglob("*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"No data parquet under {dataset}")
+    rows = pq.read_table(paths, columns=["index", "episode_index", "frame_index", "observation.state"])
+    rows = rows.sort_by("index").to_pydict()
+    count, seq_len, hidden = (int(meta[key]) for key in ("n_samples", "seq_len", "vlm_hidden_dim"))
+    if rows["index"] != list(range(count)):
+        raise ValueError("Cache requires the complete dataset in contiguous global-index order")
+    episode_ids = np.asarray(rows["episode_index"], dtype=np.int64)
+    frame_ids = np.asarray(rows["frame_index"], dtype=np.int64)
+    proprio = np.asarray(rows["observation.state"], dtype=np.float32)
+    if proprio.ndim != 2 or not np.isfinite(proprio).all():
+        raise ValueError("Dataset states must be a finite (frames, state_dim) array")
+    rng = np.random.default_rng(args.seed)
+    selected, targets = [], []
+    for episode, intervals in sorted(annotations.items()):
+        indices = np.flatnonzero(episode_ids == episode)
+        if not len(indices) or not np.array_equal(frame_ids[indices], np.arange(len(indices))):
+            raise ValueError(f"Episode {episode} has missing or unordered frames")
+        marked = np.zeros(len(indices), dtype=bool)
+        for start, end in intervals:
+            if not 0 <= start <= end < len(indices):
+                raise ValueError(f"Episode {episode}: interval [{start}, {end}] is out of bounds")
+            marked[start:end + 1] = True
+        if args.all_frames:
+            chosen = np.arange(len(indices))
+        else:
+            positive = [rng.choice(np.arange(start, end + 1), min(args.pos_per_interval, end - start + 1),
+                                   replace=False) for start, end in intervals]
+            negative = rng.choice(np.flatnonzero(~marked), min(args.neg_per_episode, int((~marked).sum())),
+                                  replace=False)
+            chosen = np.unique(np.concatenate([*positive, negative]))
+        selected.extend(indices[chosen].tolist())
+        targets.extend(marked[chosen].astype(np.int64).tolist())
+    if not selected:
+        raise ValueError("No annotated frames selected")
+    indices = np.asarray(selected, dtype=np.int64)
+    checkpoint = torch.load(args.rlt_checkpoint, map_location="cpu", weights_only=False, mmap=True)
+    trained_cache = checkpoint.get("effective_args", {}).get("precomputed_path")
+    if not trained_cache or Path(trained_cache).resolve() != cache:
+        raise ValueError("Stage 1 checkpoint was not trained from this cache")
+    if checkpoint.get("rlt_architecture") != "paper_v1" or checkpoint.get("image_only") is not True:
+        raise ValueError("Expected a paper_v1 image-only Stage 1 checkpoint")
+    config_fields = {field.name for field in fields(PI05RLTConfig) if field.init}
+    config = {key: value for key, value in checkpoint["config"].items() if key in config_fields}
+    config["mode"] = "online_rl"
+    config["device"] = str(device)
+    rlt_config = PI05RLTConfig(**config)
+    if rlt_config.vlm_hidden_dim != hidden:
+        raise ValueError("Cache hidden dimension disagrees with Stage 1 encoder")
+    encoder = RLTokenEncoder(rlt_config)
+    encoder.load_state_dict(checkpoint["encoder_state_dict"], strict=True)
+    encoder.to(device).eval().requires_grad_(False)
+    for name, dtype, shape in (
+        ("prefix_out.mmap", np.float16, (count, seq_len, hidden)),
+        ("prefix_mask.mmap", np.bool_, (count, seq_len)),
+    ):
+        if (cache / name).stat().st_size != int(np.prod(shape)) * np.dtype(dtype).itemsize:
+            raise ValueError(f"Unexpected file size for {cache / name}")
+    prefix = np.memmap(cache / "prefix_out.mmap", dtype=np.float16, mode="r", shape=(count, seq_len, hidden))
+    masks = np.memmap(cache / "prefix_mask.mmap", dtype=np.bool_, mode="r", shape=(count, seq_len))
+    z_rl = np.empty((len(indices), rlt_config.rlt_hidden_dim), dtype=np.float16)
+    logger.info("Encoding %d frames from %d episodes; z_dim=%d, proprio_dim=%d, device=%s",
+                len(indices), len(annotations), rlt_config.rlt_hidden_dim, proprio.shape[1], device)
+    started = time.monotonic()
+    with torch.inference_mode():
+        for start in range(0, len(indices), args.batch_size):
+            batch = indices[start:start + args.batch_size]
+            embedding = torch.from_numpy(np.array(prefix[batch], copy=True)).to(device=device, dtype=torch.float32)
+            mask = torch.from_numpy(np.array(masks[batch], copy=True)).to(device)
+            if not mask.any(dim=1).all() or not torch.isfinite(embedding).all():
+                raise ValueError(f"Invalid prefix embeddings at batch starting {start}")
+            encoded = encoder(embedding, mask=mask)
+            if not torch.isfinite(encoded).all():
+                raise ValueError(f"Non-finite z_rl at batch starting {start}")
+            z_rl[start:start + len(batch)] = encoded.cpu().numpy().astype(np.float16)
+            if start == 0 or (start // args.batch_size + 1) % 25 == 0 or start + len(batch) == len(indices):
+                logger.info("Encoded %d/%d frames (%.1fs)", start + len(batch), len(indices), time.monotonic() - started)
+    provenance = {"cache_path": str(cache), "cache_metadata": meta,
+                  "rlt_checkpoint": str(Path(args.rlt_checkpoint).resolve()),
+                  "rlt_step": int(checkpoint["step"]),
+                  "annotations_sha256": hashlib.sha256(Path(args.annotations).read_bytes()).hexdigest(),
+                  "state_dim": int(proprio.shape[1]), "all_frames": args.all_frames}
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output, z_rl=z_rl, proprio=proprio[indices], labels=np.asarray(targets, dtype=np.int64),
+                        episode=episode_ids[indices], frame=frame_ids[indices], annotations=json.dumps(annotations),
+                        provenance=json.dumps(provenance))
+    logger.info("Saved %d samples to %s (%.1f%% positive)", len(indices), output, 100 * np.mean(targets))
+
+
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
+    if args.pos_per_interval < 0 or args.neg_per_episode < 0:
+        raise ValueError("Sampling counts must be non-negative")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable")
+    device = torch.device(args.device)
     annotations = load_annotations(args.annotations)
     if not annotations:
         raise ValueError("Annotations file contains no intervals")
+    if args.cache_path:
+        precompute_from_cache(args, annotations, device)
+        return
+    if args.all_frames:
+        raise ValueError("--all_frames requires --cache_path")
+    if not args.pi05_path or not args.tokenizer_path:
+        raise ValueError("Provide --pi05_path and --tokenizer_path, or --cache_path")
 
     samples = sample_dataset_frames(
         args.dataset_path,
@@ -153,7 +283,8 @@ def main() -> None:
     frame_ids = np.asarray(dataset.hf_dataset["frame_index"], dtype=np.int64)
 
     z_rl_out = np.zeros((len(samples), rlt_config.rlt_hidden_dim), dtype=np.float16)
-    proprio_out = np.zeros((len(samples), 6), dtype=np.float32)
+    state_dim = int(dataset.meta.features["observation.state"]["shape"][0])
+    proprio_out = np.zeros((len(samples), state_dim), dtype=np.float32)
     labels_out = np.zeros(len(samples), dtype=np.int64)
     episode_out = np.zeros(len(samples), dtype=np.int64)
     frame_out = np.zeros(len(samples), dtype=np.int64)

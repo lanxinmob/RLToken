@@ -26,7 +26,7 @@ import torch
 
 # The v3 parquet reader caches under ~/.cache by default, which is read-only in
 # some sandboxes; redirect to a writable temp dir before any dataset access.
-_CACHE = Path(tempfile.gettempdir()) / "hf_datasets_cache_rlt_test"
+_CACHE = Path(tempfile.gettempdir()) / "hf_datasets_cache_zsw_test"
 os.environ["HF_HOME"] = str(_CACHE)
 os.environ["HF_DATASETS_CACHE"] = str(_CACHE / "datasets")
 _CACHE.mkdir(parents=True, exist_ok=True)

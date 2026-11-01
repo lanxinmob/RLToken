@@ -248,6 +248,11 @@ def train(
 ) -> dict:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     seed = args.seed if seed is None else seed
+    torch.manual_seed(seed)
+    train_idx = np.flatnonzero(~val_mask)
+    val_idx = np.flatnonzero(val_mask)
+    if len(train_idx) == 0 or len(val_idx) == 0:
+        raise ValueError("Both train and validation sets must be non-empty")
     z_dim = features["z_rl"].shape[1]
     proprio_dim = features["proprio"].shape[1]
     model = CriticalPhaseClassifier(
@@ -258,8 +263,8 @@ def train(
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    proprio_mean = features["proprio"].mean(axis=0).astype(np.float32)
-    proprio_std = features["proprio"].std(axis=0).astype(np.float32) + 1e-6
+    proprio_mean = features["proprio"][train_idx].mean(axis=0).astype(np.float32)
+    proprio_std = features["proprio"][train_idx].std(axis=0).astype(np.float32) + 1e-6
 
     z_t = torch.from_numpy(features["z_rl"]).to(device)
     p_t = (
@@ -267,11 +272,6 @@ def train(
         - torch.from_numpy(proprio_mean).to(device)
     ) / torch.from_numpy(proprio_std).to(device)
     labels_t = torch.from_numpy(features["labels"]).to(device)
-
-    train_idx = np.flatnonzero(~val_mask)
-    val_idx = np.flatnonzero(val_mask)
-    if len(train_idx) == 0 or len(val_idx) == 0:
-        raise ValueError("Both train and validation sets must be non-empty")
 
     # Group training samples by episode, sorted by frame, so each forward pass
     # sees one episode's probability SEQUENCE. A total-variation penalty on the
@@ -287,8 +287,10 @@ def train(
     if not train_groups:
         raise ValueError("No training episodes available")
 
-    best_val_acc = 0.0
+    best_val_acc = -1.0
     best_state = None
+    best_epoch = None
+    history = []
     rng = np.random.RandomState(seed)
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -319,12 +321,15 @@ def train(
                     (model(z_t[batch], p_t[batch]).argmax(dim=-1) == labels_t[batch]).sum().item()
                 )
         val_acc = val_correct / len(val_idx)
+        history.append({"epoch": epoch, "loss": total_loss / len(train_idx),
+                        "train_accuracy": train_acc, "validation_accuracy": val_acc})
         logger.info(
             "Epoch %2d/%d | loss %.4f | train acc %.3f | val acc %.3f",
             epoch, args.epochs, total_loss / len(train_idx), train_acc, val_acc,
         )
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     return {
@@ -338,6 +343,11 @@ def train(
         "val_acc": float(best_val_acc),
         "seed": seed,
         "schema_version": 1,
+        "best_epoch": best_epoch,
+        "history": history,
+        "train_episodes": sorted(int(episode) for episode in np.unique(features["episode"][train_idx])),
+        "validation_episodes": sorted(int(episode) for episode in np.unique(features["episode"][val_idx])),
+        "training_args": vars(args),
     }
 
 

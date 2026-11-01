@@ -7,8 +7,8 @@ configuration of the RL-Token-Pi05 pipeline on SO-101:
 
 - ``z_rl`` dim 2048 (matches the frozen VLA token dim, per the paper)
 - ``state_dim = action_dim = 6`` (5 joints + gripper)
-- RL chunk = ``n_action_steps_rl = 10`` steps, subsampled with
-  ``action_stride = 2`` from π0.5's 50-step reference chunk
+- RL chunk = ``n_action_steps_rl = 10`` contiguous steps;
+  ``action_stride = 2`` selects overlapping replay window starts
 - paper full-output MLP actor/critic with fixed std ``policy_fixed_std``
   (no residual mode)
 
@@ -70,7 +70,7 @@ class PI05RLTConfig(PreTrainedConfig):
     action_dim: int = 6            # 5 joints + gripper
     state_dim: int = 6
     n_action_steps_rl: int = 10    # RL chunk executed per policy call
-    action_stride: int = 2         # subsample stride over π0.5's 50-step chunk
+    action_stride: int = 2         # stride between replay window starts
     # Canonical SO-101 feature names ("{joint}.pos") for the trained action
     # order. Declared so export_rlt_pretrained can persist it into config.json
     # and rollout boundaries can validate/reorder before touching hardware.

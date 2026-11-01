@@ -90,8 +90,29 @@ def supports_rtc_inference(policy: PreTrainedPolicy) -> bool:
     return True
 
 
+def _prefix_attention_end(chunk_size: int, execution_horizon: int) -> int:
+    """Official RTC prefix attention end: ``H - s``.
+
+    ``execution_horizon`` is the execution horizon ``s`` (model steps between
+    replans), not the inference delay.  The deployment queue previously used
+    ``s`` itself as the prefix length, which cut the guided overlap from H-s
+    down to s.  Clamped to >= 1 for the local RTC processor.
+    """
+    chunk_size = int(chunk_size)
+    horizon = int(execution_horizon)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    horizon = min(max(horizon, 1), chunk_size)
+    return max(1, chunk_size - horizon)
+
+
 def _normalize_prev_actions_length(prev_actions: torch.Tensor, target_steps: int) -> torch.Tensor:
-    """Pad or truncate RTC prefix actions to a fixed length for stable compiled inference."""
+    """Pad or truncate RTC prefix actions to the guided prefix length.
+
+    ``target_steps`` is the prefix attention end ``H - s`` (not ``s``): the
+    weights beyond it are zero, so truncating there keeps the full guided
+    overlap for stable compiled inference.
+    """
     if prev_actions.ndim != 2:
         raise ValueError(f"Expected 2D [T, A] tensor, got shape={tuple(prev_actions.shape)}")
     steps, action_dim = prev_actions.shape
@@ -495,13 +516,28 @@ class RTCInferenceEngine(InferenceEngine):
                                         policy_device=policy_device,
                                     )
 
+                        chunk_size = int(getattr(policy_config, "chunk_size", 0) or 0)
+                        if chunk_size <= 0:
+                            raise ValueError(
+                                "RTC deployment requires policy.config.chunk_size to compute "
+                                "the official prefix attention end H - s"
+                            )
+                        attention_end = _prefix_attention_end(
+                            chunk_size, self._rtc_config.execution_horizon
+                        )
+                        logger.debug(
+                            "RTC prefix attention: H=%d s=%d end=%d",
+                            chunk_size, self._rtc_config.execution_horizon, attention_end,
+                        )
+
                         if prev_actions is not None:
                             prev_actions = _normalize_prev_actions_length(
-                                prev_actions, target_steps=self._rtc_config.execution_horizon
+                                prev_actions, target_steps=attention_end
                             )
 
                         actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
+                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions,
+                            execution_horizon=attention_end,
                         )
 
                         original = actions.squeeze(0).clone()

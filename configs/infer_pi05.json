@@ -40,10 +40,6 @@
   "actor_noise_std": 0.02,
   "reset_between_episodes": true,
   "manual_positioning": false,       // true = place the follower by hand before each episode
-  "actor_max_relative_target": {     // per-step degree limit applied to Actor actions only
-    "shoulder_pan": 7.0, "shoulder_lift": 10.0, "elbow_flex": 8.0,
-    "wrist_flex": 8.0, "wrist_roll": 4.0, "gripper": 7.0
-  },
   "observation_retries": 8,          // retries for a transient camera/observation fault
   "observation_retry_delay_s": 0.5,
   "camera_preflight_retries": 6,     // fresh-frame attempts per camera before aborting

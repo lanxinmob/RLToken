@@ -35,6 +35,7 @@ import os
 import pickle
 import random
 import signal
+import select
 import shutil
 import sys
 import traceback
@@ -60,24 +61,49 @@ from rlt_core import *  # noqa: F401,F403  (shared runtime core, see rlt_core.py
 # star import above does not bring them in; replay restore and stratified
 # sampling need them here, hence the explicit import.
 from rlt_core import COLLECTION_PHASE_ONLINE, COLLECTION_PHASE_WARMUP  # noqa: F401
+from rlt_action_transform import (
+    AcceptedActionTransform,
+    EXECUTION_CONTRACT,
+    EXECUTION_STATE_KEY,
+    execution_state_from_observation,
+    smooth_actions_torch,
+)
 
 SHUTDOWN = False
 EMERGENCY_STOP = False
-ACTOR_ENABLED = False  # Toggle with 'a' key during episode
+GRACEFUL_QUIT_REQUESTED = False
+ACTOR_ENABLED = False  # Initialized from auto_critical in main; 'a' toggles permission.
 SKIP_EPISODE = False  # Skip to next episode with 'g' key
 FINISH_EPISODE = False  # Finish current episode early with 'f' key (still asks y/n for terminal reward)
-CRITICAL_PHASE_ACTIVE = False  # Toggle with 'c' (on = RLT replay collection); resets each episode
+CRITICAL_PHASE_ACTIVE = False  # Training: stays on until manual c/f; resets each episode
+CRITICAL_MANUAL_STOPPED = False  # Manual c OFF blocks automatic re-entry for this episode
 CRITICAL_MANUAL_OVERRIDE_AT = 0.0  # wall time of the last manual 'c' press (auto-detector cooldown)
 HIL_FORCE_RESUME = False  # Press 's' during HIL to exit human control and resume the policy immediately
 HIL_TOGGLE_REQUESTED = False  # Press 'h' to toggle HIL mode (Evo-RL style explicit intervention switch)
+HIL_TOGGLE_COUNT = 0  # Number of queued explicit HIL toggles not yet consumed by the rollout loop
 POSITION_TOGGLE_REQUESTED = False  # Press 'p': pre-episode manual positioning toggle (NOT HIL, never enters replay). Sticky: a press during the previous episode tail is honored at the next positioning phase.
 POSITIONING_STATE = "off"  # Main-thread broadcast for console feedback: "off" | "waiting" | "active"
+
+
+def consume_hil_toggle() -> bool:
+    """Consume one queued explicit h toggle and keep later presses pending."""
+    global HIL_TOGGLE_REQUESTED, HIL_TOGGLE_COUNT
+    if HIL_TOGGLE_COUNT <= 0:
+        HIL_TOGGLE_REQUESTED = False
+        return False
+    HIL_TOGGLE_COUNT -= 1
+    HIL_TOGGLE_REQUESTED = HIL_TOGGLE_COUNT > 0
+    return True
 
 
 
 
 class ConsoleInputManager:
     """Own stdin in one thread so safety controls and reward prompts cannot race.
+
+    An interactive terminal is put into single-key mode, so command keys take
+    effect immediately without pressing Enter. Non-terminal streams keep the
+    line-oriented path for pipes, tests and scripted input.
 
     With --auto_critical enabled, 'a' must not require a prior 'c' press:
     CRITICAL_PHASE_ACTIVE mirrors the detector state and flips between True and
@@ -90,9 +116,9 @@ class ConsoleInputManager:
         15:15:49  Actor mode requires the critical phase: press 'c' first
         15:15:53  Actor mode ON          (only succeeded after pressing 'c')
 
-    In automatic mode the takeover timing is decided by the detector anyway, so
-    'a' only enables the Actor; whether it actually takes over is still decided
-    by CRITICAL_PHASE_ACTIVE at every control step.
+    In automatic mode Actor permission starts enabled. The 'a' key toggles this
+    permission without bypassing the warmup, update-count or critical-phase
+    gates. A manual disable remains in effect across episodes.
     """
 
     def __init__(self, stream=None, *, auto_critical: bool = False):
@@ -101,13 +127,15 @@ class ConsoleInputManager:
         self._condition = threading.Condition()
         self._running = False
         self._thread: threading.Thread | None = None
-        self._last_toggle_time = 0.0
+        self._terminal_fd: int | None = None
+        self._terminal_state = None
         # Whether auto critical detection is on; decides if 'a' still requires a prior 'c'
         self._auto_critical = bool(auto_critical)
 
     def start(self) -> None:
         if self._running:
             return
+        self._enable_single_key_mode()
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -118,18 +146,63 @@ class ConsoleInputManager:
             self._condition.notify_all()
         if self._thread:
             self._thread.join(timeout=0.2)
+        self._restore_terminal()
+
+    def _enable_single_key_mode(self) -> None:
+        """Use cbreak input only for a real interactive terminal."""
+        try:
+            if not self._stream.isatty():
+                return
+            fd = self._stream.fileno()
+            if not os.isatty(fd):
+                return
+            import termios
+            import tty
+            self._terminal_fd = fd
+            self._terminal_state = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except (AttributeError, ImportError, OSError):
+            self._terminal_fd = None
+            self._terminal_state = None
+
+    def _restore_terminal(self) -> None:
+        if self._terminal_fd is None or self._terminal_state is None:
+            return
+        try:
+            import termios
+            termios.tcsetattr(self._terminal_fd, termios.TCSADRAIN, self._terminal_state)
+        except (ImportError, OSError):
+            pass
+        finally:
+            self._terminal_fd = None
+            self._terminal_state = None
+
+    def _read_value(self) -> str | None:
+        if self._terminal_fd is not None:
+            ready, _, _ = select.select([self._terminal_fd], [], [], 0.1)
+            if not ready:
+                return None
+            data = os.read(self._terminal_fd, 1)
+            if not data:
+                return ""
+            return data.decode(errors="ignore").lower()
+        line = self._stream.readline()
+        if not line:
+            time.sleep(0.05)
+            return None
+        return line.strip().lower()
 
     def _loop(self) -> None:
-        global EMERGENCY_STOP, SHUTDOWN, ACTOR_ENABLED, SKIP_EPISODE, FINISH_EPISODE, CRITICAL_PHASE_ACTIVE, HIL_FORCE_RESUME, HIL_TOGGLE_REQUESTED, CRITICAL_MANUAL_OVERRIDE_AT, POSITION_TOGGLE_REQUESTED
+        global EMERGENCY_STOP, SHUTDOWN, GRACEFUL_QUIT_REQUESTED, ACTOR_ENABLED, SKIP_EPISODE, FINISH_EPISODE, CRITICAL_PHASE_ACTIVE, CRITICAL_MANUAL_STOPPED, HIL_FORCE_RESUME, HIL_TOGGLE_REQUESTED, HIL_TOGGLE_COUNT, CRITICAL_MANUAL_OVERRIDE_AT, POSITION_TOGGLE_REQUESTED
         while self._running and not SHUTDOWN:
             try:
-                line = self._stream.readline()
+                value = self._read_value()
             except Exception:
                 return
-            if not line:
-                time.sleep(0.05)
+            if value is None:
                 continue
-            value = line.strip().lower()
+            if not value or value in ("\r", "\n"):
+                continue
             if value.startswith("e"):
                 EMERGENCY_STOP = True
                 logger.warning("[KEY] EMERGENCY STOP requested (press 'e')")
@@ -138,6 +211,7 @@ class ConsoleInputManager:
                     self._condition.notify_all()
                 return
             if value.startswith("q"):
+                GRACEFUL_QUIT_REQUESTED = True
                 SHUTDOWN = True
                 logger.info("[KEY] Graceful quit requested (press 'q')")
                 print("[KEY] Quit requested", flush=True)
@@ -145,11 +219,10 @@ class ConsoleInputManager:
                     self._condition.notify_all()
                 return
             if value.startswith("a"):
-                # Actor mode is gated on the critical phase: pressing 'a' only
-                # turns the RL actor on while CRITICAL_PHASE_ACTIVE ('c' state);
-                # pressing 'a' again turns it off. The state is sticky across
-                # episodes — it is never reset automatically, only by another
-                # explicit 'a' press.
+                # Toggle permission; execution readiness is checked separately.
+                # Manual mode requires an active critical phase to enable it;
+                # automatic mode allows toggling before the detector fires.
+                # The permission remains sticky across episodes.
                 if ACTOR_ENABLED:
                     ACTOR_ENABLED = False
                     logger.info("[KEY] Actor mode OFF (press 'a' to re-enable)")
@@ -190,10 +263,10 @@ class ConsoleInputManager:
                     self._condition.notify_all()
                 continue
             if value.startswith("c"):
-                # Toggle the critical phase: press once to START recording the
-                # critical steps, press again to STOP recording (the rest of the
-                # episode runs without entering replay).
+                # Manual OFF ends the segment even though detector OFF is
+                # ignored in training. Only another c can reopen it.
                 CRITICAL_PHASE_ACTIVE = not CRITICAL_PHASE_ACTIVE
+                CRITICAL_MANUAL_STOPPED = not CRITICAL_PHASE_ACTIVE
                 CRITICAL_MANUAL_OVERRIDE_AT = time.time()
                 if CRITICAL_PHASE_ACTIVE:
                     logger.info("[KEY] Critical phase STARTED; RLT replay collection is active")
@@ -215,18 +288,15 @@ class ConsoleInputManager:
                 continue
             if value.startswith("h"):
                 # Explicit HIL mode toggle (Evo-RL style): enter intervention if
-                # autonomous, exit intervention if already in HIL. Debounce so a
-                # quick double press does not toggle twice.
-                now = time.monotonic()
-                if now - self._last_toggle_time < 1.0:
-                    logger.info("[KEY] HIL toggle debounced (1s cooldown); ignored.")
-                    print("[KEY] HIL toggle debounced", flush=True)
-                else:
-                    self._last_toggle_time = now
-                    if HIL_TOGGLE_REQUESTED is False:
-                        HIL_TOGGLE_REQUESTED = True
-                        logger.info("[KEY] HIL mode toggle requested (press 'h').")
-                        print("[KEY] HIL toggle", flush=True)
+                # autonomous, exit intervention if already in HIL.
+                # Keep every explicit press in a small queue.  The rollout
+                # thread may take a moment to complete the synchronized handoff;
+                # a second h must still be available to request the return to
+                # policy instead of being lost to a debounce window.
+                HIL_TOGGLE_COUNT += 1
+                HIL_TOGGLE_REQUESTED = True
+                logger.info("[KEY] HIL mode toggle requested (press 'h'; queued=%d).", HIL_TOGGLE_COUNT)
+                print(f"[KEY] HIL toggle (queued={HIL_TOGGLE_COUNT})", flush=True)
                 with self._condition:
                     self._condition.notify_all()
                 continue
@@ -256,6 +326,16 @@ class ConsoleInputManager:
                 self._condition.notify_all()
 
     def prompt_episode_reward(self) -> tuple[float, bool, bool]:
+        # Keys typed while the episode was still running must not answer the
+        # next reward prompt.  In cbreak mode the input thread queues every
+        # ordinary character, so an old y/n could otherwise be consumed
+        # immediately when this prompt appears and make the next episode start
+        # before the operator has answered it.
+        with self._condition:
+            stale = len(self._responses)
+            self._responses.clear()
+        if stale:
+            logger.info("[INPUT] Discarded %d stale response(s) before the episode reward prompt", stale)
         print("\nWas this episode successful? [y/n/d(iscard)/q(uit)]: ", end="", flush=True)
         while not SHUTDOWN and not EMERGENCY_STOP:
             with self._condition:
@@ -264,12 +344,16 @@ class ConsoleInputManager:
                     continue
                 response = self._responses.popleft()
             if response in ("y", "yes", "1"):
+                print("\n[INPUT] Episode marked successful", flush=True)
                 return 1.0, True, False
             if response in ("n", "no", "0"):
+                print("\n[INPUT] Episode marked unsuccessful", flush=True)
                 return 0.0, True, False
             if response in ("d", "discard"):
+                print("\n[INPUT] Episode discarded", flush=True)
                 return 0.0, True, True
             if response in ("q", "quit"):
+                print("\n[INPUT] Quit accepted at episode reward prompt", flush=True)
                 return 0.0, False, False
             print("  Please enter 'y', 'n', 'd', or 'q': ", end="", flush=True)
         return 0.0, False, False
@@ -332,7 +416,12 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 @dataclass
 class DeferredBoundarySnapshot:
-    """Observation captured at takeover; expensive boundary inference is deferred."""
+    """Observation captured at takeover; expensive boundary inference is deferred.
+
+    ``state`` is the physical follower state (ARX joint radians and gripper
+    metres).  It is deliberately kept separate from the normalized
+    ``BoundaryContext.proprio`` used by the Actor/Critic.
+    """
 
     observation: dict
     state: torch.Tensor
@@ -371,6 +460,7 @@ class DeferredExecutionWindow:
     actions: list[torch.Tensor]
     sources: list[int]
     intervention_flags: list[bool]
+    requested_actions: list[torch.Tensor] | None = None
 
 
 @dataclass
@@ -382,6 +472,7 @@ class StepRecord:
     intervention: bool
     step_id: int           # absolute episode control-step id
     ref_row: torch.Tensor | None = None  # VLA reference row for this step (normalized); None for HUMAN steps
+    requested_action: torch.Tensor | None = None  # pre-SDK requested row (normalized)
 
 
 def clone_observation(obs: dict) -> dict:
@@ -395,6 +486,123 @@ def clone_observation(obs: dict) -> dict:
         else:
             result[key] = copy.deepcopy(value)
     return result
+
+
+@dataclass(frozen=True)
+class PrefetchedPi05Plan:
+    actions: torch.Tensor
+    z_rl: torch.Tensor
+    target_step: int
+    source_step: int
+    inference_s: float
+    observed_at: float
+    rtc_prefix_steps: int = 0
+    rtc_delay: int = 0
+
+
+class AsyncPi05Planner:
+    """One CPU-owned plan in flight; invalidation never waits for the GPU.
+
+    Only the control thread reads hardware. The worker receives detached
+    observations and returns CPU actions, so executing the active window does
+    not synchronize with CUDA work for the next window.
+    """
+
+    def __init__(self, predict):
+        self.predict = predict
+        self.busy = threading.Event()
+        self.inference_s = 0.0
+        self._lock = threading.Lock()
+        self._thread = None
+        self._generation = 0
+        self._target_step = None
+        self._result = None
+        self._error = None
+
+    def matches(self, step: int) -> bool:
+        with self._lock:
+            return self._target_step == step
+
+    def submit(self, observation: dict, state: torch.Tensor, *, source_step: int, target_step: int,
+               prefix: torch.Tensor | None = None, delay: int = 0,
+               horizon: int | None = None) -> bool:
+        if state.device.type != "cpu":
+            raise ValueError("Async planning snapshots must be on CPU")
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            observation = clone_observation(observation)
+            state = state.detach().clone()
+            prefix = None if prefix is None else prefix.detach().cpu().clone()
+            generation = self._generation
+            self._target_step = target_step
+            self._result = self._error = None
+            observed_at = time.monotonic()
+            self.busy.set()
+
+            def worker():
+                result = error = None
+                try:
+                    actions, z_rl = self.predict(observation, state, prefix, delay, horizon)
+                    actions = actions.detach().cpu().clone()
+                    z_rl = z_rl.detach().cpu().clone()
+                    if actions.ndim != 3 or actions.shape[0] != 1 or not torch.isfinite(actions).all():
+                        raise ValueError("Background pi0.5 plan must be a finite [1, time, action] tensor")
+                    if z_rl.ndim != 2 or z_rl.shape[0] != 1 or not torch.isfinite(z_rl).all():
+                        raise ValueError("Background z_rl must be a finite [1, hidden] tensor")
+                    result = PrefetchedPi05Plan(
+                        actions, z_rl, target_step, source_step,
+                        time.monotonic() - observed_at, observed_at,
+                        0 if prefix is None else int(prefix.shape[1]), int(delay),
+                    )
+                except Exception as exc:
+                    error = exc
+                finally:
+                    with self._lock:
+                        if generation == self._generation:
+                            self._result, self._error = result, error
+                        self.busy.clear()
+
+            self._thread = threading.Thread(target=worker, name="pi05-prefetch", daemon=True)
+            self._thread.start()
+            return True
+
+    def poll(self, step: int) -> PrefetchedPi05Plan | None:
+        with self._lock:
+            if self._target_step != step or self.busy.is_set():
+                return None
+            if self._error is not None:
+                raise RuntimeError("Background pi0.5 inference failed") from self._error
+            result, self._result = self._result, None
+            if result is not None:
+                self.inference_s = result.inference_s
+                self._target_step = None
+            return result
+
+    def prefetch_at(self, window_steps: int, control_fps: float) -> int:
+        estimate = self.inference_s if self.inference_s > 0 else 0.15
+        lead = max(1, math.ceil(estimate * control_fps) + 1)
+        return max(0, window_steps - lead)
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._generation += 1
+            self._target_step = None
+            self._result = self._error = None
+
+    def join(self, timeout: float = 2.0) -> bool:
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            return not thread.is_alive()
+        return True
+
+
+def configure_pi05_vision_attention(policy) -> None:
+    # On the local GPU, SigLIP SDPA changed outputs even for identical serial
+    # inputs. Eager attention has the same equations and gives repeatable
+    # features; configure only this frozen vision tower, not global backends.
+    policy.model.paligemma_with_expert.paligemma.model.vision_tower.set_attn_implementation("eager")
 
 
 class CriticalPhaseRecorder:
@@ -530,10 +738,18 @@ def materialize_deferred_windows(
     transitions = []
     for item in deferred:
         window = ExecutionWindow(resolve(item.start))
-        for action, source, intervention in zip(
+        requests = item.requested_actions
+        if requests is not None and len(requests) != len(item.actions):
+            raise ValueError("Deferred requested action count does not match executed action count")
+        for index, (action, source, intervention) in enumerate(zip(
             item.actions, item.sources, item.intervention_flags, strict=True,
-        ):
-            window.append(action, source, intervention)
+        )):
+            window.append(
+                action,
+                source,
+                intervention,
+                requested_action=None if requests is None else requests[index],
+            )
         transitions.append(build_transition(
             window, resolve(item.end), horizon=horizon, action_dim=action_dim,
         ))
@@ -555,10 +771,19 @@ def build_transition(
     if len(window.sources) != window.executed_steps:
         raise ValueError("Execution window source count does not match action count")
     actions = torch.zeros(horizon, action_dim, dtype=torch.float32)
+    requested = torch.zeros(horizon, action_dim, dtype=torch.float32)
     stacked = torch.stack(window.actions, dim=0).cpu()
     if stacked.shape[1] != action_dim:
         raise ValueError(f"Executed action dim {stacked.shape[1]} != expected {action_dim}")
     actions[:window.executed_steps] = stacked
+    requested_rows = [
+        action if requested_action is None else requested_action
+        for action, requested_action in zip(window.actions, window.requested_actions, strict=True)
+    ]
+    requested_stacked = torch.stack(requested_rows, dim=0).cpu()
+    if requested_stacked.shape != stacked.shape:
+        raise ValueError("Requested action shape does not match executed action shape")
+    requested[:window.executed_steps] = requested_stacked
     refs = window.boundary.ref_chunk.detach().cpu().squeeze(0).float().clone()
     if refs.shape != (horizon, action_dim):
         raise ValueError(f"Reference chunk shape {tuple(refs.shape)} != {(horizon, action_dim)}")
@@ -579,6 +804,7 @@ def build_transition(
         proprio=window.boundary.proprio.detach().cpu().numpy(),
         ref_chunk=refs.numpy(),
         action_chunk=actions.numpy(),
+        requested_chunk=requested.numpy(),
         rewards=rewards,
         done=bool(terminal),
         next_z_rl=next_boundary.z_rl.detach().cpu().numpy().squeeze(),
@@ -592,6 +818,8 @@ def build_transition(
         intervention_flag=intervention,
         episode_id=window.boundary.episode_id,
         step_id=window.boundary.step_id,
+        execution_state=window.boundary.execution_state,
+        next_execution_state=next_boundary.execution_state,
     )
 
 
@@ -665,7 +893,12 @@ def build_stride2_transitions(
 
         window = ExecutionWindow(resolve(start_snapshot))
         for record in records[start_idx:end_idx]:
-            window.append(record.action, record.source, record.intervention)
+            window.append(
+                record.action,
+                record.source,
+                record.intervention,
+                requested_action=record.requested_action,
+            )
         if window.executed_steps == 0:
             continue
         ends_at_terminal = terminal_snapshot is not None and end_snapshot is terminal_snapshot
@@ -695,8 +928,172 @@ def build_stride2_transitions(
 
 
 def sample_fixed_std_action(mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """Sample a training-only action chunk from the actor's fixed-std Gaussian."""
-    return mean + std * torch.randn_like(mean)
+    """Sample one temporally coherent Gaussian perturbation per action chunk."""
+    if mean.ndim >= 2:
+        noise = torch.randn_like(mean[..., :1, :]).expand_as(mean)
+    else:
+        noise = torch.randn_like(mean)
+    return mean + std * noise
+
+
+def add_chunk_noise(action: torch.Tensor, std: float) -> torch.Tensor:
+    """Add one normalized-space noise vector to every row of an action chunk."""
+    if std <= 0:
+        return action
+    if action.ndim < 2:
+        return action + torch.randn_like(action) * std
+    return action + torch.randn_like(action[..., :1, :]).expand_as(action) * std
+
+
+def resampled_chunk_length(source_steps: int, *, source_hz: float, target_hz: float) -> int:
+    """Return the t=0-anchored length used by :func:`resample_chunk`."""
+    if source_steps < 1 or not math.isfinite(float(source_hz)) or not math.isfinite(float(target_hz)):
+        raise ValueError("source_steps and sampling rates must be finite and positive")
+    if source_hz <= 0 or target_hz <= 0:
+        raise ValueError("sampling rates must be positive")
+    if abs(float(target_hz) - float(source_hz)) < 1e-9 or source_steps < 2:
+        return int(source_steps)
+    duration = (int(source_steps) - 1) / float(source_hz)
+    return max(1, int(np.floor(duration * float(target_hz) + 1e-9)) + 1)
+
+
+def resample_chunk(targets: torch.Tensor, *, source_hz: float, target_hz: float) -> torch.Tensor:
+    """Linear resample of a (1, time, dim) chunk anchored at t=0 (execution-only grid)."""
+    if abs(float(target_hz) - float(source_hz)) < 1e-9 or targets.shape[1] < 2:
+        return targets
+    array = targets.detach().cpu().numpy()[0]
+    model_times = np.arange(array.shape[0], dtype=np.float64) / float(source_hz)
+    count = resampled_chunk_length(array.shape[0], source_hz=source_hz, target_hz=target_hz)
+    command_times = np.arange(count, dtype=np.float64) / float(target_hz)
+    out = np.column_stack([
+        np.interp(command_times, model_times, array[:, dimension])
+        for dimension in range(array.shape[1])
+    ])
+    return torch.as_tensor(out, dtype=targets.dtype).unsqueeze(0)
+
+
+def model_action_index_for_tick(tick: int, *, tick_hz: float, action_hz: float) -> int:
+    """Map an execution-grid tick to the nearest raw policy action index."""
+    if tick < 0 or not math.isfinite(float(tick_hz)) or not math.isfinite(float(action_hz)):
+        raise ValueError("tick and sampling rates must be finite and non-negative")
+    if tick_hz <= 0 or action_hz <= 0:
+        raise ValueError("sampling rates must be positive")
+    return max(0, int(round(float(tick) * float(action_hz) / float(tick_hz))))
+
+
+def model_action_index_for_command(command: int, *, command_hz: float, action_hz: float) -> int:
+    """Map a command-grid tick to the model action it is executing.
+
+    Mirrors the deployment path's ``PreparedChunk.model_index_for_command``:
+    command ``k`` covers ``[k/command_hz, (k+1)/command_hz)``, so the model
+    action being executed is ``ceil((k+1) * action_hz / command_hz) - 1``.
+    Rounding instead (as ``model_action_index_for_tick`` does for plan age)
+    shifts the RTC prefix by one action on half of the grid.
+    """
+    if command < 0 or not math.isfinite(float(command_hz)) or not math.isfinite(float(action_hz)):
+        raise ValueError("command and sampling rates must be finite and non-negative")
+    if command_hz <= 0 or action_hz <= 0:
+        raise ValueError("sampling rates must be positive")
+    return max(
+        0,
+        int(math.ceil((int(command) + 1) * float(action_hz) / float(command_hz) - 1e-9)) - 1,
+    )
+
+
+def command_index_for_model_step(model_step: int, *, command_hz: float, action_hz: float) -> int:
+    """Return the first command tick at/after a model action index.
+
+    Used to slice a full-chunk command grid at the current plan age, matching
+    pi0.5's ``chunk_start = skip`` convention (2 model actions at 30 Hz ->
+    command tick 7 at 100 Hz).
+    """
+    if model_step < 0 or not math.isfinite(float(command_hz)) or not math.isfinite(float(action_hz)):
+        raise ValueError("model_step and sampling rates must be finite and non-negative")
+    if command_hz <= 0 or action_hz <= 0:
+        raise ValueError("sampling rates must be positive")
+    return max(
+        0,
+        int(math.ceil(float(model_step) * float(command_hz) / float(action_hz) - 1e-9)),
+    )
+
+
+def model_action_count_for_ticks(ticks: int, *, tick_hz: float, action_hz: float) -> int:
+    """Return the conservative number of raw actions consumed by ticks."""
+    if ticks < 0 or not math.isfinite(float(tick_hz)) or not math.isfinite(float(action_hz)):
+        raise ValueError("ticks and sampling rates must be finite and non-negative")
+    if tick_hz <= 0 or action_hz <= 0:
+        raise ValueError("sampling rates must be positive")
+    if ticks == 0:
+        return 0
+    return max(1, int(math.ceil(float(ticks) * float(action_hz) / float(tick_hz) - 1e-9)))
+
+
+def prefix_attention_end(chunk_size: int, execute_horizon: int) -> int:
+    """Official RTC prefix attention end: ``H - s``.
+
+    ``s`` is the execution horizon (actions executed between replans), not the
+    inference delay.  The last ``s`` actions of the new chunk do not overlap
+    the previous chunk and stay unguided.  Clamped to >= 1 for the local RTC
+    processor (which uses >= 1 as the guided end).
+    """
+    chunk_size = int(chunk_size)
+    horizon = int(execute_horizon)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    horizon = min(max(horizon, 1), chunk_size)
+    return max(1, chunk_size - horizon)
+
+
+def blend_start_targets(
+    targets: torch.Tensor,
+    measured_state: torch.Tensor,
+    steps: int,
+    *,
+    joint_count: int,
+) -> torch.Tensor:
+    """Blend the first physical joint targets from the measured boundary pose.
+
+    ``targets`` and ``measured_state`` are physical ARX values (rad/m).  The
+    normalized Actor/Critic state is intentionally not accepted here.  The
+    gripper and any non-arm columns remain untouched.
+    """
+    if targets.ndim != 3 or targets.shape[0] != 1:
+        raise ValueError(f"targets must have shape (1, time, action), got {tuple(targets.shape)}")
+    if measured_state.ndim != 1 or measured_state.shape[0] < joint_count:
+        raise ValueError(
+            f"measured_state must have at least {joint_count} physical values, got {tuple(measured_state.shape)}"
+        )
+    if steps < 0:
+        raise ValueError("steps must be non-negative")
+    if joint_count < 0 or joint_count > targets.shape[-1]:
+        raise ValueError("joint_count must fit inside the target action dimension")
+    if steps == 0 or targets.shape[1] == 0 or joint_count == 0:
+        return targets
+    count = min(int(steps), int(targets.shape[1]))
+    result = targets.clone()
+    measured = measured_state[:joint_count].to(device=result.device, dtype=result.dtype)
+    for index in range(count):
+        alpha = float(index + 1) / float(count)
+        result[0, index, :joint_count] = (
+            (1.0 - alpha) * measured + alpha * result[0, index, :joint_count]
+        )
+    return result
+
+
+def clamp_actor_action(action: torch.Tensor, limit: float) -> torch.Tensor:
+    """Bound Actor outputs before they reach the execution transform."""
+    return action.clamp(min=-limit, max=limit)
+
+
+def sample_training_proposal(actor, batch, reference_dropout, actor_action_limit: float = 1.5):
+    ref = batch["ref_chunk"]
+    if reference_dropout > 0:
+        drop = torch.rand(ref.shape[0], device=ref.device) < reference_dropout
+        ref = ref.masked_fill(drop[:, None, None], 0.0)
+    mean, std = actor(batch["z_rl"], batch["proprio"], ref, training=True)
+    mean = clamp_actor_action(mean, actor_action_limit)
+    sampled = clamp_actor_action(sample_fixed_std_action(mean, std), actor_action_limit)
+    return mean, sampled
 
 
 def polyak_update(source: torch.nn.Module, target: torch.nn.Module, tau: float) -> None:
@@ -763,12 +1160,17 @@ class ReplayBuffer:
             self._position = (self._position + 1) % self.capacity
             self._size = min(self._size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
+    def sample(self, batch_size: int, *, require_execution_state: bool = False) -> dict[str, torch.Tensor]:
         with self._lock:
             batch_size = min(batch_size, self._size)
             if batch_size == 0:
                 return {}
-            if self._sample_strategy == "stratified":
+            if require_execution_state:
+                eligible = np.flatnonzero(self._execution_eligible())
+                if eligible.size < batch_size:
+                    return {}
+                indices = self._rng.choice(eligible, size=batch_size, replace=True)
+            elif self._sample_strategy == "stratified":
                 indices = self._sample_stratified_indices(batch_size)
             else:
                 indices = self._sample_uniform_indices(batch_size)
@@ -783,6 +1185,14 @@ class ReplayBuffer:
             else:
                 result[k] = torch.from_numpy(v.astype(np.float32))
         return result
+
+    def _execution_eligible(self) -> np.ndarray:
+        if self._storage is None:
+            return np.zeros(0, dtype=bool)
+        return self._storage["execution_valid"][:self._size] & (
+            self._storage["next_execution_valid"][:self._size]
+            | self._storage["done"][:self._size]
+        )
 
     def _sample_uniform_indices(self, batch_size: int) -> np.ndarray:
         return self._rng.integers(0, self._size, size=batch_size)
@@ -854,6 +1264,7 @@ class ReplayBuffer:
             "position": self._position,
             "sample_strategy": self._sample_strategy,
             "intervention_count": self.intervention_count,
+            "execution_entries": int(self._execution_eligible().sum()),
         }
 
     def __len__(self):
@@ -868,6 +1279,7 @@ class ReplayManager:
         self._journal_path = journal_path
         self._lock = threading.Lock()
         self._adds_total = 0
+        self._execution_adds_total = 0
         os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
         if restore:
             self._restore_from_journal()
@@ -887,13 +1299,18 @@ class ReplayManager:
                 )
                 raise
             self._adds_total += 1
+            self._execution_adds_total += int(
+                transition.execution_state is not None
+                and (transition.next_execution_state is not None or transition.done)
+            )
 
-    def sample_batch(self, batch_size: int) -> dict[str, torch.Tensor]:
-        return self._buffer.sample(batch_size)
+    def sample_batch(self, batch_size: int, *, require_execution_state: bool = False) -> dict[str, torch.Tensor]:
+        return self._buffer.sample(batch_size, require_execution_state=require_execution_state)
 
     def stats(self) -> dict:
         base = self._buffer.stats()
         base["adds_total"] = self._adds_total
+        base["execution_adds_total"] = self._execution_adds_total
         base["journal_path"] = self._journal_path
         return base
 
@@ -901,6 +1318,7 @@ class ReplayManager:
         if not os.path.exists(self._journal_path):
             return
         restored = 0
+        execution_restored = 0
         try:
             with open(self._journal_path, "rb") as f:
                 while True:
@@ -918,6 +1336,7 @@ class ReplayManager:
                         proprio=record["proprio"].astype(np.float32),
                         ref_chunk=record["ref_chunk"].astype(np.float32),
                         action_chunk=record["action_chunk"].astype(np.float32),
+                        requested_chunk=record.get("requested_chunk", record["action_chunk"]).astype(np.float32),
                         rewards=record["rewards"].astype(np.float32),
                         done=bool(record["done"]),
                         next_z_rl=record["next_z_rl"].astype(np.float32),
@@ -932,9 +1351,12 @@ class ReplayManager:
                         intervention_flag=bool(record["intervention_flag"]),
                         episode_id=int(record["episode_id"]),
                         step_id=int(record["step_id"]),
+                        execution_state=(record["execution_state"] if record.get("execution_valid", False) else None),
+                        next_execution_state=(record["next_execution_state"] if record.get("next_execution_valid", False) else None),
                     )
                     self._buffer.add(t)
                     restored += 1
+                    execution_restored += int(t.execution_state is not None and (t.next_execution_state is not None or t.done))
         # EOFError means the stream ended cleanly on a record boundary (including
         # an empty file), which is a normal exit. For any other exception: a crash
         # can only truncate the last written record, so if some records were
@@ -950,6 +1372,7 @@ class ReplayManager:
                 raise
             logger.warning("Journal restore stopped at %d entries: %s", restored, exc)
         self._adds_total = restored
+        self._execution_adds_total = execution_restored
         if restored:
             logger.info("Restored %d transitions from journal %s", restored, self._journal_path)
 
@@ -973,6 +1396,7 @@ class TeleopManager:
         poll_hz: float = 100.0,
     ):
         self.leader = leader
+        self.JOINT_NAMES = list(getattr(leader, "joint_names", self.JOINT_NAMES))
         self.threshold = threshold
         self.trigger_frames = trigger_frames
         self.release_frames = release_frames
@@ -1243,6 +1667,44 @@ def canonical_digest(payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Runtime-only switches that never change the learning contract.  Resuming
+# across them only changes how stale a prefetched reference chunk is, so they
+# are compared and logged instead of hard-failing.
+_RESUME_IGNORED_PROVENANCE = frozenset({"digest", "async_inference"})
+# Hardware execution knobs that change the online transform while keeping the
+# replay schema valid. A change is reported and re-checked against the stored
+# execution profile instead of blocking the resume outright.
+_RESUME_TUNABLE_HARDWARE = frozenset({
+    "joint_speed", "gripper_speed", "chunk_filter", "chunk_ema_alpha",
+})
+
+
+def _comparable_provenance(provenance: dict) -> dict:
+    result = {k: v for k, v in provenance.items() if k not in _RESUME_IGNORED_PROVENANCE}
+    hardware = result.get("hardware_config")
+    if isinstance(hardware, dict):
+        result["hardware_config"] = {
+            k: v for k, v in hardware.items() if k not in _RESUME_TUNABLE_HARDWARE
+        }
+    return result
+
+
+def resume_provenance_diff(saved: dict, current: dict) -> tuple[str, ...]:
+    """Return the provenance keys that block a resume; empty means compatible."""
+    left = _comparable_provenance(saved)
+    right = _comparable_provenance(current)
+    if set(left) != set(right):
+        return ("<keys>",)
+    return tuple(sorted(key for key in left if left[key] != right[key]))
+
+
+def execution_transform_diff(saved: dict, current: dict) -> tuple[str, ...]:
+    """Return changed execution-profile fields for resume diagnostics."""
+    return tuple(sorted(
+        key for key in set(saved) | set(current) if saved.get(key) != current.get(key)
+    ))
+
+
 def prepare_output_dir(path: Path, *, dry_run: bool) -> None:
     """Fail closed on prior contents; dry-run performs no filesystem mutation."""
     if path.exists():
@@ -1389,12 +1851,40 @@ def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: tor
                 state[key] = value.to(device)
 
 
+def migrate_legacy_critic_proprio(checkpoint: dict, *, z_dim: int, old_proprio_dim: int,
+                                  new_proprio_dim: int, action_dim: int, chunk: int) -> None:
+    """Insert zero execution-anchor columns into pre-contract ARX critics."""
+    extra = new_proprio_dim - old_proprio_dim
+    split = z_dim + old_proprio_dim
+    old_input = split + chunk * action_dim
+    for key in ("critic_state_dict", "critic_target_state_dict"):
+        state = checkpoint[key]
+        for layer in ("q1.0.weight", "q2.0.weight"):
+            weight = state[layer]
+            if weight.ndim != 2 or weight.shape[1] != old_input:
+                raise ValueError(f"Cannot migrate {key}.{layer}: expected input {old_input}, got {tuple(weight.shape)}")
+            state[layer] = torch.cat((weight[:, :split], weight.new_zeros(weight.shape[0], extra), weight[:, split:]), dim=1)
+    optimizer = checkpoint.get("critic_optimizer", {})
+    names = list(checkpoint["critic_state_dict"])
+    parameter_ids = optimizer.get("param_groups", [{}])[0].get("params", [])
+    ids = {name: parameter_ids[index] for index, name in enumerate(names) if index < len(parameter_ids)}
+    for layer in ("q1.0.weight", "q2.0.weight"):
+        state = optimizer.get("state", {}).get(ids.get(layer), {})
+        for moment in ("exp_avg", "exp_avg_sq"):
+            value = state.get(moment)
+            if isinstance(value, torch.Tensor) and value.ndim == 2 and value.shape[1] == old_input:
+                state[moment] = torch.cat((value[:, :split], value.new_zeros(value.shape[0], extra), value[:, split:]), dim=1)
+    checkpoint["critic_proprio_dim"] = new_proprio_dim
+
+
 def prepare_resume_checkpoint(path: Path, output_dir: Path, *, dry_run: bool) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"--resume_from checkpoint does not exist: {path}")
     if path.parent.resolve() == output_dir.resolve():
         raise ValueError("--output_dir must be a new directory, not the resume checkpoint directory.")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint.get("execution_contract") not in (None, EXECUTION_CONTRACT):
+        raise ValueError("Resume checkpoint has an unsupported execution contract")
     required = {
         "actor_state_dict", "actor_target_state_dict", "critic_state_dict", "critic_target_state_dict",
         "actor_optimizer", "critic_optimizer", "episode", "episode_rewards", "episode_interventions",
@@ -1493,7 +1983,7 @@ def _strip_json_comments(text: str) -> str:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RLT Stage 2: Online RL on SO-101 with Intervention (π0.5)")
+    parser = argparse.ArgumentParser(description="RLT Stage 2: Online RL with hardware backends (π0.5)")
     parser.add_argument("--config", type=str, default=None,
                         help="JSON config file; explicit CLI arguments override its values")
     # Model paths
@@ -1507,6 +1997,9 @@ def parse_args():
                         help="Explicit stats.json override (default: checkpoint normalizer state)")
     parser.add_argument("--task", type=str, default="pick up the red cube and place it in the box",
                         help="Task description for the VLA")
+    # Backends validate offline; controllers are constructed after dry-run.
+    parser.add_argument("--hardware_backend", type=str, default="")
+    parser.add_argument("--hardware_config", type=str, default="{}")
     # Robot connection
     parser.add_argument("--follower_port", type=str, default="",
                         help="Follower serial port (required unless --dry_run)")
@@ -1525,10 +2018,18 @@ def parse_args():
                         help="Compress images before sending them to Rerun")
     parser.add_argument("--display_fps", type=float, default=10.0,
                         help="Maximum Rerun logging frequency")
+    parser.add_argument("--preview", action="store_true",
+                        help="Show the ARX camera in a local OpenCV window")
     parser.add_argument("--pad_missing_cameras", action="store_true",
                         help="Fill unmapped checkpoint image features with zero-pixel tensors (test-only)")
     parser.add_argument("--max_relative_target", type=str, default=None,
                         help="Optional positive degree scalar or JSON per-joint motor limits; omitted disables clipping")
+    parser.add_argument("--start_blend_steps", type=int, default=0,
+                        help="Ease from the measured pose into the plan over N control steps at "
+                             "episode start; keeps the first chunk from jumping to the model target")
+    parser.add_argument("--exec_grid_hz", type=float, default=None,
+                        help="Execution-only dense resampling grid; requires --vla_only. "
+                             "100 plays each 30 Hz chunk as ~3.3x denser points at the same tick rate")
     parser.add_argument("--vla_only", action="store_true",
                         help="Disable actor execution; frozen VLA + leader takeover only")
     parser.add_argument("--inference_only", action="store_true",
@@ -1542,6 +2043,8 @@ def parse_args():
                              "success rate (never fed back into learning).")
     parser.add_argument("--rtc_enabled", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable Pi0.5 real-time chunking guidance")
+    parser.add_argument("--rtc_mode", choices=["guided", "trained"], default="guided",
+                        help="RTC mode; guided is compatible with the frozen pi0.5 checkpoint")
     parser.add_argument("--rtc_execution_horizon", type=int, default=10,
                         help="Actions executed between Pi0.5 replans; must match RLT horizon")
     parser.add_argument("--rtc_prefix_attention_schedule", choices=["EXP", "LINEAR", "ONES", "ZEROS"], default="EXP",
@@ -1558,8 +2061,10 @@ def parse_args():
                         help="Save key frames at critical-phase on/off transitions "
                              "(default: on; use --no-save_critical_frames to disable).")
     parser.add_argument("--auto_critical", action="store_true",
-                        help="Automatically toggle CRITICAL_PHASE_ACTIVE with a trained classifier "
-                             "(requires --critical_classifier); manual 'c' always overrides for a cooldown.")
+                        help="Automatically start the critical phase with a trained classifier "
+                             "and keep training active until manual 'c' OFF or episode finish. "
+                             "Enable Actor permission at startup (warmup/update gates still apply). "
+                             "Requires --critical_classifier; 'a' toggles permission and 'c' overrides detection.")
     parser.add_argument("--critical_classifier", type=str, default=None,
                         help="Path to a trained critical-phase classifier checkpoint "
                              "(scripts/train_critical_classifier.py).")
@@ -1578,12 +2083,12 @@ def parse_args():
     parser.add_argument("--auto_critical_start_delay_steps", type=int, default=60,
                         help="Do not auto-ON during the first N steps of an episode (the reset/approach "
                              "phase is never the critical phase; avoids frame-0 false positives).")
-    parser.add_argument("--actor_critical_delay_steps", type=int, default=15,
+    parser.add_argument("--actor_critical_delay_steps", type=int, default=0,
                         help="Minimum consecutive critical-phase CONTROL steps before the RL actor "
                              "may take control. Counted per boundary window (each window advances "
                              "the counter by n_action_steps_rl=10), so 15 = the actor switches at "
-                             "the 2nd window after detection. Guards transient auto-critical false "
-                             "positives from grabbing control away from VLA.")
+                             "the 2nd window after detection. Default 0 allows takeover in the "
+                             "first detected critical window once warmup/update gates pass.")
     parser.add_argument("--auto_critical_once", action=argparse.BooleanOptionalAction, default=True,
                         help="Each episode has ONE critical segment: after the auto-detector has "
                              "turned ON and then OFF, it will not auto-ON again in the same episode "
@@ -1622,7 +2127,7 @@ def parse_args():
                         help="Minimum direct-follow duration and post-motion quiet guard before policy resume")
     # Training
     parser.add_argument("--max_episodes", type=int, default=200)
-    parser.add_argument("--steps_per_episode", type=int, default=300)
+    parser.add_argument("--steps_per_episode", type=int, default=900)
     parser.add_argument("--control_fps", type=float, default=10.0)
     parser.add_argument("--output_dir", type=str, default="checkpoints/rlt_stage2_pi05")
     parser.add_argument("--resume_from", type=str, default=None,
@@ -1640,6 +2145,10 @@ def parse_args():
                         help="Execute the actor's MEAN action deterministically (no Gaussian sampling). "
                              "Eliminates sampling jitter; the actor output then tracks its BC-anchored "
                              "mean (≈ reference) so execution is smooth like the VLA.")
+    parser.add_argument("--actor_action_limit", type=float, default=1.5,
+                        help="Absolute normalized Actor output limit before execution and critic evaluation")
+    parser.add_argument("--actor_gate_advantage", type=float, default=0.0,
+                        help="Require batch-mean Q(actor)-Q(reference) to exceed this value before Actor execution")
     parser.add_argument("--actor_noise_std", type=float, default=0.0,
                         help="Exploration noise (normalized space) added on top of the mean when "
                              "actor_execute_mean is on (e.g. 0.01 = small exploration without full "
@@ -1675,6 +2184,8 @@ def parse_args():
                         help="BC regularization weight after learner warmup")
     parser.add_argument("--online_q_weight", type=float, default=1.0,
                         help="Q-maximization weight after learner warmup")
+    parser.add_argument("--weight_anneal_updates", type=int, default=50_000,
+                        help="Updates over which BC/Q weights interpolate from warmup_* to online_* values")
     parser.add_argument("--delta_weight", type=float, default=0.0,
                         help="Smoothness (delta) loss weight: penalizes the difference between the "
                              "actor's per-step action deltas and the reference/human action deltas "
@@ -1686,6 +2197,11 @@ def parse_args():
     parser.add_argument("--learner_warmup_updates", type=int, default=0,
                         help="Optional extra pure-BC learner updates (0 matches paper Algorithm 1)")
     parser.add_argument("--policy_fixed_std", type=float, default=0.05)
+    parser.add_argument("--chunk_smooth_taps", type=int, default=5,
+                        help="Zero-phase FIR taps along the action chunk.  Training applies them "
+                             "to each 10-action Q transform window; --vla-only smooths the full "
+                             "policy chunk before slicing so window edges stay in the filter "
+                             "interior. 0 disables smoothing")
     parser.add_argument("--reference_dropout", type=float, default=0.5,
                         help="Probability of zeroing the reference chunk during actor training")
     parser.add_argument("--actor_hidden_dim", type=int, default=256,
@@ -1705,14 +2221,16 @@ def parse_args():
                         help="Steps the ACTOR executes before re-planning (receding horizon). "
                              "0 = full RL chunk (10 steps).")
     parser.add_argument("--replan_every_window", action=argparse.BooleanOptionalAction, default=True,
-                        help="Replan a fresh 50-step VLA inference at EVERY 10-step window for "
-                             "both the frozen VLA and the RL actor, so the reference chunk comes "
-                             "from the current observation (paper Algorithm 1: a~t:t+C-1 ~ "
-                             "pi_vla(st)). Cost: the full 10-step diffusion (~1-5 s on the 3B "
-                             "model) runs every 0.33 s, so the robot moves in bursts. Disable "
-                             "with --no-replan_every_window to reuse the cached 50-step chunk "
-                             "and replan only when it is exhausted (lerobot-record cadence: "
-                             "smooth, but references become chunk-continuation).")
+                        help="Synchronously generate a new VLA reference from the boundary "
+                             "observation for each 10-step RL window by default. "
+                             "Disable to reuse a full cached 50-step plan instead.")
+    parser.add_argument("--async_inference", action=argparse.BooleanOptionalAction, default=False,
+                        help="Experimental VLA prefetch from an earlier observation; its reference "
+                             "timing differs from the Actor's boundary state. Disabled for the "
+                             "paper baseline; requires replan_every_window and RTC off.")
+    parser.add_argument("--inference_timeout_s", type=float, default=2.0,
+                        help="Maximum interruptible wait for an asynchronous plan; hold the last "
+                             "target while late, then stop on timeout.")
     parser.add_argument("--leader_mirror_torque_limit", type=float, default=0.5,
                         help="Leader mirror holding torque as a fraction of max (0-1). Lower = the "
                              "leader yields to a human more easily (easier HIL takeover).")
@@ -1744,7 +2262,7 @@ def parse_args():
         unknown = sorted(set(config_values) - set(actions))
         if unknown:
             parser.error(f"Unknown config keys: {', '.join(unknown)}")
-        for key in ("cameras", "camera_map"):
+        for key in ("cameras", "camera_map", "hardware_config"):
             if isinstance(config_values.get(key), dict):
                 config_values[key] = json.dumps(config_values[key])
         for key in ("max_relative_target", "actor_max_relative_target"):
@@ -1765,9 +2283,15 @@ def parse_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global SHUTDOWN, EMERGENCY_STOP, SKIP_EPISODE, FINISH_EPISODE, CRITICAL_PHASE_ACTIVE, HIL_FORCE_RESUME, HIL_TOGGLE_REQUESTED
-    global POSITION_TOGGLE_REQUESTED, POSITIONING_STATE
+    global SHUTDOWN, EMERGENCY_STOP, GRACEFUL_QUIT_REQUESTED, SKIP_EPISODE, FINISH_EPISODE, CRITICAL_PHASE_ACTIVE, HIL_FORCE_RESUME, HIL_TOGGLE_REQUESTED
+    global ACTOR_ENABLED, POSITION_TOGGLE_REQUESTED, POSITIONING_STATE, CRITICAL_MANUAL_STOPPED
     args = parse_args()
+    if args.actor_max_relative_target is not None:
+        raise ValueError(
+            "--actor_max_relative_target is disabled: actor-only clipping is not part of the "
+            "trained execution contract"
+        )
+    ACTOR_ENABLED = bool(args.auto_critical)
     if args.control_fps <= 0:
         raise ValueError("--control_fps must be positive.")
     if args.reset_steps < 1:
@@ -1792,10 +2316,27 @@ def main():
         raise ValueError("--leader_hil_min_dwell_s must be finite and non-negative.")
     if args.rtc_execution_horizon < 0:
         raise ValueError("--rtc_execution_horizon must be non-negative (0 = disable RTC).")
+    if args.rtc_mode not in {"guided", "trained"}:
+        raise ValueError("--rtc_mode must be guided or trained.")
     if args.rtc_max_guidance_weight <= 0 or not math.isfinite(args.rtc_max_guidance_weight):
         raise ValueError("--rtc_max_guidance_weight must be finite and positive.")
+    if args.inference_timeout_s <= 0 or not math.isfinite(args.inference_timeout_s):
+        raise ValueError("--inference_timeout_s must be finite and positive.")
+    if args.async_inference and not args.replan_every_window:
+        raise ValueError("--async_inference requires --replan_every_window.")
+    if args.start_blend_steps < 0:
+        raise ValueError("--start_blend_steps must be non-negative.")
+    if args.exec_grid_hz is not None:
+        if args.exec_grid_hz <= 0:
+            raise ValueError("--exec_grid_hz must be positive.")
+        if not args.vla_only:
+            raise ValueError("--exec_grid_hz is an execution-only validation grid; pass --vla_only.")
     if args.actor_residual_scale != 0:
         raise ValueError("Paper-aligned RLT uses a full-output Actor; --actor_residual_scale must be 0.")
+    if args.actor_action_limit <= 0 or not math.isfinite(args.actor_action_limit):
+        raise ValueError("--actor_action_limit must be finite and positive.")
+    if not math.isfinite(args.actor_gate_advantage):
+        raise ValueError("--actor_gate_advantage must be finite.")
     if args.intervention_reward_bonus != 0:
         raise ValueError(
             "Paper-aligned RLT uses terminal-only binary rewards; --intervention_reward_bonus must be 0."
@@ -1808,8 +2349,15 @@ def main():
         raise ValueError("--inference_only cannot be combined with --vla_only (nothing to run).")
     if args.display_fps <= 0 or not math.isfinite(args.display_fps):
         raise ValueError("--display_fps must be finite and positive.")
-    if not args.dry_run and (not args.follower_port or not args.leader_port):
+    if not args.dry_run and not args.hardware_backend and (not args.follower_port or not args.leader_port):
         raise ValueError("--follower_port and --leader_port are required unless --dry_run")
+
+    backend_module = None
+    hardware_config = None
+    if args.hardware_backend:
+        import importlib
+        backend_module = importlib.import_module(args.hardware_backend)
+        hardware_config = json.loads(args.hardware_config)
 
     # ── Print effective training parameters ────────────────────────────────
     logger.info("=" * 78)
@@ -1827,7 +2375,18 @@ def main():
                 args.control_fps, args.steps_per_episode, args.max_episodes)
     logger.info("  warmup_episodes = %s | actor_start_updates = %s | actor_execution_steps = %s",
                 args.warmup_episodes, args.actor_start_updates, args.actor_execution_steps)
-    logger.info("  rtc_enabled     = %s | rtc_execution_horizon = %s", args.rtc_enabled, args.rtc_execution_horizon)
+    logger.info("  actor_permission = %s | auto_critical = %s (execution remains gated by training readiness and critical phase)",
+                ACTOR_ENABLED, args.auto_critical)
+    logger.info("  rtc_enabled     = %s | rtc_mode = %s | rtc_execution_horizon = %s",
+                args.rtc_enabled, args.rtc_mode, args.rtc_execution_horizon)
+    logger.info("  async_inference = %s | inference_timeout_s = %s", args.async_inference, args.inference_timeout_s)
+    logger.info("  RTC = %s | mode = %s | horizon = %s | async prefix = %s",
+                args.rtc_enabled, args.rtc_mode, args.rtc_execution_horizon,
+                "wired" if (args.async_inference and args.rtc_enabled) else "off")
+    if not args.async_inference and args.replan_every_window:
+        logger.info("  action inference: synchronous at each window boundary; VLA reference, "
+                    "z_rl and Actor use the same observation. Learner updates remain asynchronous "
+                    "when training is enabled.")
     logger.info("RL / reinforcement learning:")
     logger.info("  actor_lr = %s | critic_lr = %s | discount(gamma) = %s | target_tau = %s",
                 args.actor_lr, args.critic_lr, args.discount, args.target_tau)
@@ -1836,7 +2395,8 @@ def main():
     logger.info("  policy_fixed_std = %s | reference_dropout = %s", args.policy_fixed_std, args.reference_dropout)
     logger.info("  warmup: bc_weight = %s | q_weight = %s | learner_warmup_updates = %s",
                 args.warmup_bc_weight, args.warmup_q_weight, args.learner_warmup_updates)
-    logger.info("  online: bc_weight = %s | q_weight = %s", args.online_bc_weight, args.online_q_weight)
+    logger.info("  online: bc_weight = %s | q_weight = %s | weight_anneal_updates = %s",
+                args.online_bc_weight, args.online_q_weight, args.weight_anneal_updates)
     logger.info("  actor_start_updates = %s | warmup_episodes = %s", args.actor_start_updates, args.warmup_episodes)
     logger.info("  actor net = %s x %s | critic net = %s x %s",
                 args.actor_hidden_dim, args.actor_num_layers, args.critic_hidden_dim, args.critic_num_layers)
@@ -1846,10 +2406,11 @@ def main():
     logger.info("Safety / HIL:")
     logger.info("  dry_run         = %s | max_relative_target = %s",
                 args.dry_run, args.max_relative_target if args.max_relative_target else "disabled")
-    logger.info("  actor_max_relative_target = %s (ACTOR-only per-step clamp)",
-                args.actor_max_relative_target if args.actor_max_relative_target else "disabled")
-    logger.info("  actor_noise_std = %s | actor_execute_mean = %s | control_fps = %s",
-                args.actor_noise_std, args.actor_execute_mean, args.control_fps)
+    logger.info("  actor_max_relative_target = disabled (rejected if configured; use the ARX execution contract)")
+    logger.info("  actor_noise_std = %s | actor_execute_mean = %s | actor_action_limit = ±%s | "
+                "actor_gate_advantage = %s | control_fps = %s",
+                args.actor_noise_std, args.actor_execute_mean, args.actor_action_limit,
+                args.actor_gate_advantage, args.control_fps)
     logger.info("  leader_mirror_torque_limit = %s | intervention_threshold = %s",
                 args.leader_mirror_torque_limit, args.intervention_threshold)
     logger.info("  leader_hil_min_dwell_s = %s | intervention_release_frames = %s",
@@ -1895,7 +2456,7 @@ def main():
         args.reset_between_episodes, args.reset_steps, args.reset_dt,
         args.reset_tolerance_deg, args.reset_max_passes,
     )
-    logger.info("Press 'e' for EMERGENCY STOP, 'q' for graceful quit, 'f' to finish the episode early. Move the leader to request HIL.")
+    logger.info("Press 'e' for EMERGENCY STOP, 'q' for graceful quit, 'f' to finish early, 'h' for human takeover.")
 
     # ── Load frozen π0.5 ─────────────────────────────────────────────
     logger.info(f"Loading π0.5 from {args.pi05_path}...")
@@ -1916,6 +2477,7 @@ def main():
     # downstream .image_features / .action_feature; PI05Config.from_pretrained
     # fails because config.json keeps a "type" field not in the dataclass.
     pi05_policy = PI05Policy.from_pretrained(pretrained_name_or_path=args.pi05_path)
+    configure_pi05_vision_attention(pi05_policy)
     pi05_config = pi05_policy.config
 
     from lerobot.configs.types import RTCAttentionSchedule
@@ -1923,6 +2485,7 @@ def main():
 
     pi05_config.rtc_config = RTCConfig(
         enabled=args.rtc_enabled and args.rtc_execution_horizon > 0,
+        mode=args.rtc_mode,
         prefix_attention_schedule=RTCAttentionSchedule(args.rtc_prefix_attention_schedule),
         execution_horizon=max(args.rtc_execution_horizon, 1),  # Min 1 for config validation
         max_guidance_weight=args.rtc_max_guidance_weight,
@@ -1940,6 +2503,7 @@ def main():
     ]
     logger.info("Checkpoint image features: %s", checkpoint_image_features)
     logger.info("π0.5 loaded and frozen with official processor pipeline.")
+    logger.info("SigLIP vision attention: eager (repeatable fixed-image features).")
 
     # ── Load RLT encoder (frozen from Stage 1) ─────────────────────────
     logger.info(f"Loading RLT encoder from {args.rlt_checkpoint}...")
@@ -1947,20 +2511,29 @@ def main():
     from lerobot.policies.pi05_rlt.modeling_pi05_rlt import RLTokenEncoder, RLTChunkActor, RLTTwinCritic
 
     rlt_config = PI05RLTConfig(
+        device=str(device),
         mode="online_rl",
         discount=args.discount,
         bc_weight=args.online_bc_weight,
         target_tau=args.target_tau,
-        state_dim=6,
-        action_dim=6,
+        state_dim=pi05_config.input_features["observation.state"].shape[0],
+        action_dim=pi05_config.output_features["action"].shape[0],
         action_stride=2,
         n_action_steps_rl=10,
     )
+    if backend_module is not None:
+        hardware_config = backend_module.validate_config(hardware_config, args, rlt_config)
     if rlt_config.n_action_steps_rl != args.rtc_execution_horizon and args.rtc_execution_horizon != 0:
         raise ValueError(
             "--rtc_execution_horizon must equal PI05RLTConfig.n_action_steps_rl "
             f"({rlt_config.n_action_steps_rl}) or be 0 (disable RTC) so replay matches real execution."
         )
+    logger.info(
+        "  RTC prefix attention end = H - s = %d (H=%d, s=%d); "
+        "--rtc_execution_horizon is s, not the guided end",
+        prefix_attention_end(int(pi05_config.chunk_size), int(rlt_config.n_action_steps_rl)),
+        int(pi05_config.chunk_size), int(rlt_config.n_action_steps_rl),
+    )
     if rlt_config.action_stride < 1:
         raise ValueError("--action_stride must be positive.")
     if not 0.0 <= args.reference_dropout <= 1.0:
@@ -1984,8 +2557,12 @@ def main():
         raise ValueError("--auto_critical_override_cooldown cannot be negative.")
     if args.policy_fixed_std <= 0 or not math.isfinite(args.policy_fixed_std):
         raise ValueError("--policy_fixed_std must be finite and positive.")
+    if args.chunk_smooth_taps < 0 or (args.chunk_smooth_taps > 1 and args.chunk_smooth_taps % 2 == 0):
+        raise ValueError("--chunk_smooth_taps must be 0, 1 or an odd number of taps.")
     if args.learner_warmup_updates < 0:
         raise ValueError("--learner_warmup_updates cannot be negative.")
+    if args.weight_anneal_updates < 0:
+        raise ValueError("--weight_anneal_updates cannot be negative.")
     if args.actor_hidden_dim <= 0 or args.critic_hidden_dim <= 0:
         raise ValueError("--actor_hidden_dim and --critic_hidden_dim must be positive.")
     if args.actor_num_layers < 1 or args.critic_num_layers < 1:
@@ -2028,6 +2605,8 @@ def main():
         "actor_residual_scale": args.actor_residual_scale,
         "rl_chunk_length": rlt_config.n_action_steps_rl,
         "action_stride": rlt_config.action_stride,
+        "async_inference": args.async_inference,
+        "vision_attention": "eager",
         "reference_dropout": args.reference_dropout,
         "actor_hidden_dim": args.actor_hidden_dim,
         "actor_num_layers": args.actor_num_layers,
@@ -2035,6 +2614,9 @@ def main():
         "critic_num_layers": args.critic_num_layers,
         "stage1": stage1_provenance,
     }
+    if backend_module is not None:
+        runtime_provenance["hardware_backend"] = args.hardware_backend
+        runtime_provenance["hardware_config"] = hardware_config
     runtime_provenance["digest"] = canonical_digest(runtime_provenance)
     checkpoint_digest = ckpt.get("runtime_compatibility_digest")
     if checkpoint_digest is not None and checkpoint_digest != runtime_provenance["digest"]:
@@ -2045,21 +2627,54 @@ def main():
 
     state_q01 = torch.tensor(stats["observation.state"]["q01"], dtype=torch.float32, device=device)
     state_q99 = torch.tensor(stats["observation.state"]["q99"], dtype=torch.float32, device=device)
+    state_q01_cpu, state_q99_cpu = state_q01.cpu(), state_q99.cpu()
     action_q01 = torch.tensor(stats["action"]["q01"], dtype=torch.float32, device=device)
     action_q99 = torch.tensor(stats["action"]["q99"], dtype=torch.float32, device=device)
+    action_q01_cpu, action_q99_cpu = action_q01.cpu(), action_q99.cpu()
     logger.info(f"State q01: {state_q01.tolist()}")
     logger.info(f"State q99: {state_q99.tolist()}")
     logger.info(f"Action q01: {action_q01.tolist()}")
     logger.info(f"Action q99: {action_q99.tolist()}")
 
-    def normalize_state(state_deg: torch.Tensor) -> torch.Tensor:
-        return quantile_normalize(state_deg, state_q01, state_q99)
+    def normalize_state(state_physical: torch.Tensor) -> torch.Tensor:
+        if state_physical.device.type == "cpu":
+            return quantile_normalize(state_physical, state_q01_cpu, state_q99_cpu)
+        return quantile_normalize(state_physical, state_q01, state_q99)
 
-    def normalize_action(action_deg: torch.Tensor) -> torch.Tensor:
-        return quantile_normalize(action_deg, action_q01, action_q99)
+    def normalize_action(action_physical: torch.Tensor) -> torch.Tensor:
+        if action_physical.device.type == "cpu":
+            return quantile_normalize(action_physical, action_q01_cpu, action_q99_cpu)
+        return quantile_normalize(action_physical, action_q01, action_q99)
 
     def unnormalize_action(action_norm: torch.Tensor) -> torch.Tensor:
+        if action_norm.device.type == "cpu":
+            return quantile_unnormalize(action_norm, action_q01_cpu, action_q99_cpu)
         return quantile_unnormalize(action_norm, action_q01, action_q99)
+
+    critic_execution_dim = 2 * rlt_config.action_dim if args.hardware_backend == "rlt_stage2" else 0
+    critic_proprio_dim = rlt_config.state_dim + critic_execution_dim
+
+    def critic_proprio(batch: dict[str, torch.Tensor], *, next_state: bool = False) -> torch.Tensor:
+        """Append the physical execution anchor used by the accepted-target transform."""
+        state_key = "next_proprio" if next_state else "proprio"
+        if critic_execution_dim == 0:
+            return batch[state_key]
+        execution_key = "next_execution_state" if next_state else "execution_state"
+        execution_state = batch[execution_key]
+        if execution_state.ndim != 3 or execution_state.shape[1:] != (2, rlt_config.action_dim):
+            raise ValueError(
+                f"{execution_key} must have shape (B, 2, {rlt_config.action_dim}), "
+                f"got {tuple(execution_state.shape)}"
+            )
+        normalized_anchor = quantile_normalize(execution_state, action_q01, action_q99)
+        return torch.cat([batch[state_key], normalized_anchor.flatten(start_dim=1)], dim=-1)
+
+    def critic_action(batch: dict[str, torch.Tensor], action: torch.Tensor, *, next_state: bool = False) -> torch.Tensor:
+        """Map a normalized proposal into the same action domain the critic sees."""
+        if action_transform is not None:
+            execution_key = "next_execution_state" if next_state else "execution_state"
+            return action_transform(action, batch[execution_key], batch["valid_mask"])
+        return action.masked_fill(~batch["valid_mask"].bool().unsqueeze(-1), 0.0)
 
     # ── Create actor + critic ───────────────────────────────────────────
     actor = RLTChunkActor(
@@ -2076,11 +2691,13 @@ def main():
         rlt_config,
         hidden_dim=args.critic_hidden_dim,
         num_layers=args.critic_num_layers,
+        proprio_dim=critic_proprio_dim,
     ).to(device)
     critic_target = RLTTwinCritic(
         rlt_config,
         hidden_dim=args.critic_hidden_dim,
         num_layers=args.critic_num_layers,
+        proprio_dim=critic_proprio_dim,
     ).to(device)
     critic_target.load_state_dict(critic.state_dict())
     for p in critic_target.parameters():
@@ -2089,8 +2706,51 @@ def main():
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     if resume_checkpoint is not None:
-        if resume_checkpoint["runtime_provenance"] != runtime_provenance:
-            raise ValueError("Resume checkpoint runtime provenance does not match this Stage 2 invocation.")
+        provenance_diff = resume_provenance_diff(
+            resume_checkpoint["runtime_provenance"], runtime_provenance
+        )
+        if provenance_diff:
+            raise ValueError(
+                "Resume checkpoint runtime provenance does not match this Stage 2 invocation: "
+                f"{', '.join(provenance_diff)}"
+            )
+        saved_async = resume_checkpoint["runtime_provenance"].get("async_inference")
+        current_async = runtime_provenance.get("async_inference")
+        if saved_async != current_async:
+            logger.warning(
+                "Resuming with async_inference=%s (checkpoint was %s); reference chunks now come "
+                "from the prefetch observation instead of the execution boundary.",
+                current_async, saved_async,
+            )
+        saved_critic_proprio_dim = resume_checkpoint.get("critic_proprio_dim")
+        if saved_critic_proprio_dim is None:
+            # Older checkpoints either omitted this field or stored ``None``
+            # before the execution-anchor critic contract was introduced.
+            saved_critic_proprio_dim = rlt_config.state_dim
+        if saved_critic_proprio_dim != critic_proprio_dim:
+            legacy_arx = (
+                args.hardware_backend == "rlt_stage2"
+                and saved_critic_proprio_dim == rlt_config.state_dim
+                and critic_proprio_dim == rlt_config.state_dim + 2 * rlt_config.action_dim
+            )
+            if not legacy_arx:
+                raise ValueError(
+                    "Resume checkpoint critic input does not match this execution contract: "
+                    f"checkpoint={saved_critic_proprio_dim}, runtime={critic_proprio_dim}"
+                )
+            migrate_legacy_critic_proprio(
+                resume_checkpoint,
+                z_dim=rlt_config.rlt_hidden_dim,
+                old_proprio_dim=saved_critic_proprio_dim,
+                new_proprio_dim=critic_proprio_dim,
+                action_dim=rlt_config.action_dim,
+                chunk=rlt_config.n_action_steps_rl,
+            )
+            logger.warning(
+                "Migrated legacy ARX critic input: inserted %d zero execution-anchor columns; "
+                "critic optimizer moments were expanded too.",
+                critic_proprio_dim - saved_critic_proprio_dim,
+            )
         actor.load_state_dict(resume_checkpoint["actor_state_dict"], strict=True)
         actor_target.load_state_dict(resume_checkpoint["actor_target_state_dict"], strict=True)
         critic.load_state_dict(resume_checkpoint["critic_state_dict"], strict=True)
@@ -2184,17 +2844,15 @@ def main():
             args.camera_map, checkpoint_image_features, set(cameras_dict), pad_missing=args.pad_missing_cameras,
         )
         max_relative_target = parse_max_relative_target(args.max_relative_target)
-        actor_relative_limit = parse_max_relative_target(args.actor_max_relative_target)
     except ValueError as exc:
         logger.error("Startup preflight failed: %s", exc)
-        return
+        raise
 
 
     camera_configs = {}
     for cam_name, cam_cfg in cameras_dict.items():
         if cam_cfg.get("type") != "opencv":
-            logger.error("Only OpenCV camera configs are supported; %s has type %r.", cam_name, cam_cfg.get("type"))
-            return
+            raise ValueError(f"Only OpenCV camera configs are supported; {cam_name} has type {cam_cfg.get('type')!r}")
         # fourcc / warmup_s must be passed through: with default parameters one
         # wrist camera reported opened=True but returned 0 frames; fourcc=MJPG plus
         # a 3 s warmup was stable in practice.
@@ -2208,17 +2866,45 @@ def main():
         )
     logger.info("Physical-to-checkpoint camera map: %s", camera_feature_map)
 
+    # Validate the classifier before connecting hardware, including in dry-run.
+    critical_detector = None
+    if args.auto_critical:
+        from lerobot.policies.pi05_rlt.critical import CriticalPhaseDetector
+        critical_detector = CriticalPhaseDetector(
+            args.critical_classifier,
+            device,
+            threshold_on=args.auto_critical_threshold_on,
+            threshold_off=args.auto_critical_threshold_off,
+            smooth_steps=args.auto_critical_smooth_steps,
+            min_on_chunks=args.auto_critical_min_on_chunks,
+        )
+        if (critical_detector.z_dim, critical_detector.proprio_dim) != (
+            rlt_config.rlt_hidden_dim, rlt_config.state_dim,
+        ):
+            raise ValueError(
+                f"Critical classifier dimensions {(critical_detector.z_dim, critical_detector.proprio_dim)} "
+                f"do not match Stage 2 {(rlt_config.rlt_hidden_dim, rlt_config.state_dim)}"
+            )
+        logger.info(
+            "Auto critical-phase detection configured (on>=%.2f, off<=%.2f, smooth=%d, min_on=%d); "
+            "classifier consumes raw measured state with its own saved standardization.",
+            args.auto_critical_threshold_on, args.auto_critical_threshold_off,
+            args.auto_critical_smooth_steps, args.auto_critical_min_on_chunks,
+        )
+
     if args.dry_run:
         logger.info("Dry-run preflight succeeded; no serial ports or cameras were opened.")
         return
-    if max_relative_target is None:
+    if rlt_config.action_dim != 6 and backend_module is None:
+        raise ValueError("7D online control requires an explicit hardware backend")
+    if max_relative_target is None and backend_module is None:
         logger.warning(
             "Follower relative-target clipping is disabled. Commands still pass finite/shape validation, "
             "but no per-step degree clamp is applied."
         )
 
     # ── Connect to SO-101 ──────────────────────────────────────────────
-    logger.info("Connecting to SO-101 arms...")
+    logger.info("Connecting to %s arms...", args.hardware_backend or "SO-101")
     console = ConsoleInputManager(auto_critical=bool(args.auto_critical))
     console.start()
     follower = None
@@ -2226,26 +2912,108 @@ def main():
     follower_connected = False
     leader_connected = False
     robot_faulted = False
+    hardware = None
+    action_transform = None
+    def hardware_fault(reason):
+        global SHUTDOWN
+        SHUTDOWN = True
+        logger.error("Hardware session fault; stopping rollout: %s", reason)
+
     try:
-        follower = SO101Follower(SO101FollowerConfig(
-            port=args.follower_port,
-            id=args.follower_id,
-            cameras=camera_configs,
-            max_relative_target=max_relative_target,
-        ))
-        leader = SO101Leader(SO101LeaderConfig(port=args.leader_port, id=args.leader_id))
-        follower.connect()
-        follower_connected = True
-        leader.connect()
-        leader_connected = True
-        logger.info("Both arms connected; follower target delta limit: %s", max_relative_target)
+        if backend_module is not None:
+            hardware = backend_module.Runtime(
+                hardware_config, args, output_dir,
+                lambda: (SHUTDOWN and not GRACEFUL_QUIT_REQUESTED) or EMERGENCY_STOP,
+                hardware_fault,
+            )
+            hardware.connect()
+            if args.hardware_backend == "rlt_stage2":
+                profile = hardware.execution_transform_profile
+                saved_profile = (
+                    resume_checkpoint.get("execution_transform")
+                    if resume_checkpoint is not None else None
+                )
+                if saved_profile is not None:
+                    transform_diff = execution_transform_diff(saved_profile, profile)
+                    if transform_diff and not set(transform_diff) <= {"alpha", "max_step"}:
+                        raise ValueError(
+                            "Resume checkpoint execution transform does not match the ARX worker: "
+                            + ", ".join(transform_diff)
+                        )
+                    if transform_diff:
+                        logger.warning(
+                            "Execution transform changed on resume: alpha %s -> %s, max_step %s -> %s rad/step. "
+                            "Stored transitions stay valid, but the critic will retrain on the new contract.",
+                            saved_profile.get("alpha"), profile.get("alpha"),
+                            saved_profile.get("max_step"), profile.get("max_step"),
+                        )
+                if resume_checkpoint is not None and resume_checkpoint.get("execution_scale", 1.0) != args.actor_execution_scale:
+                    raise ValueError("Resume checkpoint actor execution scale does not match")
+                if restore_replay is not None and buffer.stats()["execution_entries"]:
+                    source_info = json.loads((Path(restore_replay).expanduser().parent / "hardware_info.json").read_text())
+                    restored_profile = source_info.get("execution_transform") or {}
+                    restored_diff = execution_transform_diff(restored_profile, profile)
+                    if restored_diff and not set(restored_diff) <= {"alpha", "max_step"}:
+                        raise ValueError(
+                            "Restored replay execution transform does not match the ARX worker: "
+                            + ", ".join(restored_diff)
+                        )
+                    if restored_diff:
+                        logger.warning(
+                            "Restored replay uses a different execution transform: alpha %s -> %s, "
+                            "max_step %s -> %s rad/step.",
+                            restored_profile.get("alpha"), profile.get("alpha"),
+                            restored_profile.get("max_step"), profile.get("max_step"),
+                        )
+                action_transform = AcceptedActionTransform(
+                    profile, stats["action"]["q01"], stats["action"]["q99"],
+                    device=device, execution_scale=args.actor_execution_scale,
+                    smooth_taps=args.chunk_smooth_taps,
+                )
+                logger.info("Actor/Critic execution domain: %s; fixed policy step budget %.6fs; "
+                            "chunk smoothing taps %s",
+                            EXECUTION_CONTRACT, profile["step_dt_s"], args.chunk_smooth_taps)
+                logger.info(
+                    "Execution smoothing: %s",
+                    "full chunk before slicing (vla-only)"
+                    if args.vla_only and args.chunk_smooth_taps > 1
+                    else "per-window (training-compatible)",
+                )
+                logger.info("Replay with controller state: %s/%s; legacy replay retained for BC only.",
+                            buffer.stats()["execution_entries"], len(buffer))
+            follower, leader = hardware.follower, hardware.leader
+            follower_connected = leader_connected = True
+        else:
+            follower = SO101Follower(SO101FollowerConfig(
+                port=args.follower_port,
+                id=args.follower_id,
+                cameras=camera_configs,
+                max_relative_target=max_relative_target,
+            ))
+            leader = SO101Leader(SO101LeaderConfig(port=args.leader_port, id=args.leader_id))
+            follower.connect()
+            follower_connected = True
+            leader.connect()
+            leader_connected = True
+        if hardware is not None:
+            if hardware.single_arm:
+                logger.info("Single ARX arm connected on %s; policy and HIL share the controller, with joint rad/s and gripper m/s limits enforced by the SDK worker.",
+                            hardware_config["follower_interface"])
+            else:
+                logger.info("Both ARX arms connected; joint rad/s and gripper m/s limits are enforced by the SDK worker.")
+        else:
+            logger.info("Both arms connected; follower target delta limit: %s", max_relative_target)
     except Exception as e:
         logger.error("Failed to connect to robot: %s", e)
-        if leader_connected:
-            leader.disconnect()
-        if follower_connected:
-            follower.disconnect()
-        return
+        if hardware is not None:
+            hardware.close()
+        else:
+            if leader_connected:
+                leader.disconnect()
+            if follower_connected:
+                follower.disconnect()
+        console.stop()
+        raise
 
     teleop = None
     training_thread = None
@@ -2253,6 +3021,9 @@ def main():
     leader_mirror_thread: threading.Thread | None = None
     leader_mirror_moving = False  # True while the leader mirror is actively driving the leader
     leader_mirror_heartbeat = 0.0  # last time the mirror thread beat (watchdog)
+    critical_recorder = None
+    planner: AsyncPi05Planner | None = None
+    planning_log = None
     visualization = None
     rerun_shutdown = None
     if args.display_data:
@@ -2282,7 +3053,7 @@ def main():
         )
 
         # ── Joint name mapping ─────────────────────────────────────────────
-        JOINT_NAMES = [
+        JOINT_NAMES = list(hardware.joint_names) if hardware is not None else [
             "shoulder_pan", "shoulder_lift", "elbow_flex",
             "wrist_flex", "wrist_roll", "gripper",
         ]
@@ -2299,7 +3070,10 @@ def main():
         def leader_action_to_tensor(leader_action: dict) -> torch.Tensor:
             return action_dict_to_tensor(leader_action, "leader")
 
+        single_arm_hil = bool(hardware is not None and hardware.single_arm)
+
         def obs_to_state_tensor(obs: dict) -> torch.Tensor:
+            """Return backend physical state; normalization happens at the RLT boundary."""
             state = {f"{joint}.pos": obs.get(f"{joint}.pos") for joint in JOINT_NAMES}
             return action_dict_to_tensor(state, "follower observation")
 
@@ -2370,7 +3144,12 @@ def main():
                     last_valid_target = actual_target
                     max_delta = float((actual_tensor - action_tensor.detach().cpu()).abs().max())
                     if max_delta > 1e-4:
-                        logger.warning("%s action clamped; max requested-vs-sent delta %.3f degrees.", source, max_delta)
+                        if hardware is not None:
+                            delta = (actual_tensor - action_tensor.detach().cpu()).abs()
+                            logger.debug("%s target limited: joints max %.6f rad, gripper %.6f m.",
+                                         source, float(delta[:-1].max()), float(delta[-1]))
+                        else:
+                            logger.warning("%s action clamped; max requested-vs-sent delta %.3f degrees.", source, max_delta)
                     if visualization is not None:
                         visualization.publish_action(actual_target)
                     return actual_tensor
@@ -2394,15 +3173,11 @@ def main():
             logger.warning("Could not capture startup leader/master reset target; automatic reset disabled: %s", exc)
 
         teleop.start()
-        logger.info(
-            "TeleopManager started: movement > %.2f° for %s samples requests HIL; "
-            "%s still samples resume policy.",
-            args.intervention_threshold, args.intervention_trigger_frames, args.intervention_release_frames,
-        )
+        logger.info("TeleopManager started: 'h' enters human control; 'h' or 's' resumes policy.")
 
-        def reset_follower_to_initial_pose() -> bool:
+        def reset_follower_to_initial_pose(*, force: bool = False, reason: str = "episode reset") -> bool:
             nonlocal robot_faulted
-            if not args.reset_between_episodes:
+            if not force and not args.reset_between_episodes:
                 logger.info("Reset skipped: --reset_between_episodes is disabled.")
                 return False
             if startup_leader_reset_target is None:
@@ -2412,7 +3187,15 @@ def main():
                 logger.warning("Reset skipped: robot/observation fault or emergency stop is active.")
                 return False
 
+            if force and hardware is not None:
+                hardware.set_phase("policy", refresh=True)
+
             target = startup_leader_reset_target
+            tolerance = (
+                math.radians(args.reset_tolerance_deg)
+                if hardware is not None else args.reset_tolerance_deg
+            )
+            logger.info("Returning follower to the startup home pose (%s).", reason)
             for reset_pass in range(1, args.reset_max_passes + 1):
                 current_obs = read_follower_observation(f"follower reset pass {reset_pass}")
                 if current_obs is None:
@@ -2420,11 +3203,11 @@ def main():
                 current = obs_to_state_tensor(current_obs)
                 initial_error = float((target - current).abs().max())
                 logger.info(
-                    "Reset pass %s/%s | max error %.2f degrees | %s steps at %.2fs",
-                    reset_pass, args.reset_max_passes, initial_error, args.reset_steps, args.reset_dt,
+                    "Reset pass %s/%s | max error %.4f | tolerance %.4f | %s steps at %.2fs",
+                    reset_pass, args.reset_max_passes, initial_error, tolerance, args.reset_steps, args.reset_dt,
                 )
-                if initial_error <= args.reset_tolerance_deg:
-                    logger.info("Reset already within %.2f degree tolerance.", args.reset_tolerance_deg)
+                if initial_error <= tolerance:
+                    logger.info("Reset already within %.4f tolerance.", tolerance)
                     return True
 
                 for i in range(1, args.reset_steps + 1):
@@ -2440,12 +3223,12 @@ def main():
                     return False
                 final_state = obs_to_state_tensor(final_obs)
                 final_error = float((target - final_state).abs().max())
-                if final_error <= args.reset_tolerance_deg:
-                    logger.info("Reset completed | final max error %.2f degrees.", final_error)
+                if final_error <= tolerance:
+                    logger.info("Reset completed | final max error %.4f.", final_error)
                     return True
                 logger.warning(
-                    "Reset pass %s incomplete | final max error %.2f > tolerance %.2f.",
-                    reset_pass, final_error, args.reset_tolerance_deg,
+                    "Reset pass %s incomplete | final max error %.4f > tolerance %.4f.",
+                    reset_pass, final_error, tolerance,
                 )
 
             logger.warning("Reset failed after %s passes; refusing to claim the initial pose was restored.", args.reset_max_passes)
@@ -2459,6 +3242,9 @@ def main():
             episode and then teleoperates the next start pose ('p'). Best-effort:
             a failed hold only logs a warning and never escalates to a fault.
             """
+            if hardware is not None:
+                hardware.set_phase("idle")
+                return
             if last_valid_target is None:
                 return
             try:
@@ -2480,14 +3266,19 @@ def main():
         preprocessor, _postprocessor = make_pre_post_processors(
             pi05_config,
             pretrained_path=str(pi05_path),
+            preprocessor_overrides={"tokenizer_processor": {"tokenizer_name": tokenizer_name},
+                                    "device_processor": {"device": str(device)}},
         )
 
-        def run_pi05_inference(
+        inference_lock = threading.Lock()
+
+        def _run_pi05_inference(
             obs: dict,
             state_tensor: torch.Tensor,
             *,
             prev_chunk_left_over: torch.Tensor | None = None,
             inference_delay: int = 0,
+            execution_horizon: int | None = None,
             raw_actions_for_embedding: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # SO-101 follower returns per-joint floats and camera frames keyed by
@@ -2498,6 +3289,8 @@ def main():
             # torch.from_numpy() doesn't choke on bare Python floats.
             raw_obs = {}
             for k, v in obs.items():
+                if k == EXECUTION_STATE_KEY:
+                    continue
                 if k in camera_feature_map:
                     raw_obs[camera_feature_map[k]] = v
                 elif isinstance(v, (int, float)):
@@ -2520,11 +3313,22 @@ def main():
                         raw_actions_full = raw_actions_full.unsqueeze(0)
                 else:
                     pi05_kwargs = {}
-                    if args.rtc_execution_horizon > 0:
+                    guidance_end = (
+                        int(execution_horizon) if execution_horizon is not None
+                        else prefix_attention_end(
+                            int(pi05_config.chunk_size), int(rlt_config.n_action_steps_rl)
+                        )
+                    )
+                    if args.rtc_enabled and guidance_end > 0:
+                        prefix = prev_chunk_left_over
+                        if prefix is not None:
+                            prefix = torch.as_tensor(
+                                prefix, dtype=torch.float32, device=device,
+                            )
                         pi05_kwargs = {
-                            "prev_chunk_left_over": prev_chunk_left_over,
-                            "inference_delay": inference_delay,
-                            "execution_horizon": args.rtc_execution_horizon,
+                            "prev_chunk_left_over": prefix,
+                            "inference_delay": max(0, int(inference_delay)),
+                            "execution_horizon": max(1, guidance_end),
                         }
                     raw_actions_full = pi05_policy.predict_action_chunk(
                         processed,
@@ -2551,7 +3355,36 @@ def main():
 
             return raw_actions_full, z_rl
 
-        def save_stage2_checkpoint(path: Path, episode: int, episode_rewards: list, episode_interventions: list, total_updates: int) -> None:
+        def run_pi05_inference(obs, state, *, realtime=False, **kwargs):
+            # Prefix extraction uses model hooks/caches shared with diffusion.
+            # Serialize all frozen-model calls and give live planning priority
+            # over deferred replay embeddings.
+            while True:
+                if not realtime and planner is not None and planner.busy.is_set():
+                    time.sleep(0.002)
+                    continue
+                with inference_lock:
+                    if not realtime and planner is not None and planner.busy.is_set():
+                        continue
+                    return _run_pi05_inference(obs, state, **kwargs)
+
+        plan_head_log = None
+        if args.exec_grid_hz:
+            plan_head_log = (output_dir / "plan_heads.jsonl").open("a", buffering=1)
+        if args.async_inference:
+            planning_log = (output_dir / "planning.jsonl").open("a", buffering=1)
+            planner = AsyncPi05Planner(
+                lambda obs, state, prefix=None, delay=0, horizon=None: run_pi05_inference(
+                    obs, state, realtime=True,
+                    prev_chunk_left_over=prefix,
+                    inference_delay=delay,
+                    execution_horizon=horizon,
+                )
+            )
+
+        latest_actor_advantage: float | None = None
+
+        def save_stage2_checkpoint(path: Path, episode: int, episode_rewards: list, episode_interventions: list) -> None:
             journal_path = output_dir / "replay_journal.pkl"
             journal_bytes = journal_path.stat().st_size if journal_path.exists() else 0
             with training_lock:
@@ -2566,13 +3399,23 @@ def main():
                     episode_rewards=episode_rewards,
                     episode_interventions=episode_interventions,
                     total_updates=total_updates,
+                    critic_updates=critic_updates,
+                    actor_updates=actor_updates,
+                    execution_contract=EXECUTION_CONTRACT if action_transform is not None else None,
+                    execution_transform=action_transform.profile if action_transform is not None else None,
+                    execution_scale=args.actor_execution_scale,
+                    critic_proprio_dim=critic_proprio_dim,
+                    aligned_critic_updates=aligned_critic_updates,
+                    actor_gate_advantage=latest_actor_advantage,
                     runtime_provenance=runtime_provenance,
                     rng_state=capture_rng_state(),
                     replay_rng_state=copy.deepcopy(buffer._rng.bit_generator.state),
                     replay_journal_bytes=journal_bytes,
                     replay_entries=replay.stats()["adds_total"],
                 )
-            atomic_torch_save(checkpoint, path)
+                # state_dict tensors alias live parameters/Adam state. Keep the
+                # learner paused until serialization, including all counters.
+                atomic_torch_save(checkpoint, path)
 
         # ── Training loop ───────────────────────────────────────────────────
         logger.info(f"\nStarting online RL for {args.max_episodes} episodes...")
@@ -2595,17 +3438,68 @@ def main():
             f"(VLA remains in control until then)."
         )
         logger.info(
+            "Actor gate requires batch-mean Q(actor)-Q(reference) > %.4f; the gate starts closed.",
+            args.actor_gate_advantage,
+        )
+        logger.info(
             "Automatic HIL: move any leader joint to align it to the follower and enter direct-follow; "
             "keep the leader still to resume policy.\n"
         )
-        logger.info("Press 'c' when the critical phase begins; only then is RLT replay recorded.")
-        logger.info("Press 'a' during episode to toggle Actor mode ON/OFF (starts OFF).")
+        if args.auto_critical:
+            logger.info("Critical phases are detected automatically; 'c' manually overrides detection for %.1f seconds.",
+                        args.auto_critical_override_cooldown)
+        else:
+            logger.info("Press 'c' when the critical phase begins; only then is RLT replay recorded.")
+        if not args.inference_only:
+            logger.info("Critical training continues until manual 'c' OFF or episode finish ('f'); detector OFF is ignored.")
+        logger.info("Actor permission: %s; press 'a' to toggle it. Warmup, update-count and critical-phase gates still apply.",
+                    "ON" if ACTOR_ENABLED else "OFF")
         logger.info("Press 'g' during episode to skip to next episode.")
 
         episode_rewards = [] if resume_checkpoint is None else list(resume_checkpoint["episode_rewards"])
         episode_interventions = [] if resume_checkpoint is None else list(resume_checkpoint["episode_interventions"])
         inference_scores: list[bool] = []  # y/n success counts in inference_only mode (never learned from)
         total_updates = 0 if resume_checkpoint is None else int(resume_checkpoint["total_updates"])
+        critic_updates = (
+            total_updates if resume_checkpoint is None
+            else int(resume_checkpoint.get("critic_updates", total_updates))
+        )
+        actor_updates = (
+            0 if resume_checkpoint is None
+            else int(resume_checkpoint.get(
+                "actor_updates",
+                (total_updates + args.critic_per_actor - 1) // args.critic_per_actor,
+            ))
+        )
+        aligned_critic_updates = (
+            int(resume_checkpoint.get("aligned_critic_updates", 0))
+            if resume_checkpoint is not None and resume_checkpoint.get("execution_contract") == EXECUTION_CONTRACT
+            else 0
+        )
+        resume_advantage = (
+            float(resume_checkpoint["actor_gate_advantage"])
+            if resume_checkpoint is not None and resume_checkpoint.get("actor_gate_advantage") is not None
+            else None
+        )
+        if resume_checkpoint is not None and action_transform is not None:
+            saved_transform = resume_checkpoint.get("execution_transform")
+            if saved_transform is not None and execution_transform_diff(saved_transform, action_transform.profile):
+                # The saved Q comparison and the aligned-update budget were
+                # measured under a different accepted-target transform.  Keep
+                # the takeover gate closed until the learner produces a fresh
+                # comparison AND accumulates the full fresh-contract update
+                # budget; otherwise the old count can open the gate early.
+                resume_advantage = None
+                aligned_critic_updates = 0
+                logger.info(
+                    "Actor gate reset on resume because the execution transform changed; "
+                    "aligned_critic_updates reset to 0 for the new contract."
+                )
+        latest_actor_advantage = resume_advantage
+        logger.info("Update counters: critic_updates=%d | actor_updates=%d", critic_updates, actor_updates)
+        if action_transform is not None:
+            logger.info("Actor readiness: aligned_critic_updates=%d/%d; need %d replay windows with controller state.",
+                        aligned_critic_updates, args.actor_start_updates, args.batch_size)
         start_episode = 1 if resume_checkpoint is None else int(resume_checkpoint["episode"]) + 1
         completed_episode = start_episode - 1
         # Rolling RL metrics (Q estimates, TD error, ...) for periodic logging.
@@ -2640,7 +3534,9 @@ def main():
             if not metrics_log_path.exists() or metrics_log_path.stat().st_size == 0:
                 append_metrics_line(
                     "# updates\tepisode\tbuffer\tq1_mean\tq1_max\tq1_rew\tq1_norew\t"
-                    "q2_mean\tq2_max\ttd_mean\ttd_max\ttd_err\tactorQ\tbc\tdelta\tn_rew\tn_done\tactor_on"
+                    "q2_mean\tq2_max\ttd_mean\ttd_max\ttd_err\tactorQ\treferenceQ\tactorAdv\t"
+                    "bc\tdelta\tn_rew\tn_done\tactor_on\t"
+                    "aligned_critic_updates\texecution_replay"
                 )
         except OSError:
             pass
@@ -2671,15 +3567,19 @@ def main():
                 f"{_fmt_metric(mean('q2_mean'))}\t{_fmt_metric(mean('q2_max'))}\t"
                 f"{_fmt_metric(mean('td_mean'))}\t{_fmt_metric(mean('td_max'))}\t"
                 f"{_fmt_metric(mean('td_err'), 5)}\t{_fmt_metric(mean('actorQ'))}\t"
+                f"{_fmt_metric(mean('referenceQ'))}\t{_fmt_metric(mean('actorAdv'))}\t"
                 f"{_fmt_metric(mean('bc'), 5)}\t{_fmt_metric(mean('delta'), 5)}\t"
                 f"{_fmt_metric(mean('n_rew'), 2)}\t{_fmt_metric(mean('n_done'), 2)}\t"
-                f"{last_actor_active}"
+                f"{last_actor_active}\t{aligned_critic_updates}\t{buffer.stats()['execution_entries']}"
             )
         if resume_checkpoint is not None:
             if args.max_episodes < start_episode - 1:
                 raise ValueError("--max_episodes cannot be less than the completed resume episode.")
             restore_rng_state(resume_checkpoint["rng_state"])
-            logger.info("Resuming at episode %s with %s updates and %s replay transitions.", start_episode, total_updates, len(buffer))
+            logger.info(
+                "Resuming at episode %s with critic_updates=%s, actor_updates=%s and %s replay transitions.",
+                start_episode, critic_updates, actor_updates, len(buffer),
+            )
         target_dt = 1.0 / args.control_fps
 
         # ── Asynchronous training worker ─────────────────────────────
@@ -2691,41 +3591,77 @@ def main():
 
         def perform_training_update() -> bool:
             """Run one critic update and (every critic_per_actor updates) one actor update."""
-            nonlocal total_updates
+            nonlocal total_updates, critic_updates, actor_updates, aligned_critic_updates, latest_actor_advantage
             if args.vla_only or SHUTDOWN or EMERGENCY_STOP:
                 return False
             with training_lock:
                 if len(buffer) < args.batch_size:
                     return False
-                batch = replay.sample_batch(args.batch_size)
+                batch = replay.sample_batch(
+                    args.batch_size, require_execution_state=action_transform is not None,
+                )
                 if not batch:
                     return False
                 batch = {k: v.to(device) for k, v in batch.items()}
+                # Old accepted actions remain useful BC targets, but missing
+                # controller state cannot be invented for a policy/TD transform.
+                bc_batch = batch if action_transform is None else {
+                    k: v.to(device) for k, v in replay.sample_batch(args.batch_size).items()
+                }
 
-                q_weight = (
-                    args.warmup_q_weight if total_updates < args.learner_warmup_updates
-                    else args.online_q_weight
-                )
+                if total_updates < args.learner_warmup_updates:
+                    weight_progress = 0.0
+                elif args.weight_anneal_updates == 0:
+                    weight_progress = 1.0
+                else:
+                    weight_progress = min(
+                        1.0,
+                        max(0.0, (total_updates - args.learner_warmup_updates)
+                            / args.weight_anneal_updates),
+                    )
                 bc_weight = (
-                    args.warmup_bc_weight if total_updates < args.learner_warmup_updates
-                    else args.online_bc_weight
+                    args.warmup_bc_weight
+                    + weight_progress * (args.online_bc_weight - args.warmup_bc_weight)
+                )
+                q_weight = (
+                    args.warmup_q_weight
+                    + weight_progress * (args.online_q_weight - args.warmup_q_weight)
                 )
                 delta_weight = args.delta_weight
                 # Populated only on actor-update steps; NaN elsewhere in the log.
                 actor_q: torch.Tensor | None = None
+                reference_q: torch.Tensor | None = None
+                actor_advantage: torch.Tensor | None = None
                 bc_penalty: torch.Tensor | None = None
                 delta_penalty: torch.Tensor | None = None
 
                 # ── Critic update ───────────────────────────────────
                 with torch.no_grad():
-                    next_action_mean, next_action_std = actor_target(
-                        batch["next_z_rl"], batch["next_proprio"],
-                        batch["next_ref_chunk"],
-                    )
-                    next_action = sample_fixed_std_action(next_action_mean, next_action_std)
-                    target_q = critic_target.q_min(
-                        batch["next_z_rl"], batch["next_proprio"], next_action
-                    )
+                    bootstrap = batch["done"].squeeze(-1) < 0.5
+                    target_q = torch.zeros_like(batch["done"])
+                    if bootstrap.any():
+                        next_action_mean, next_action_std = actor_target(
+                            batch["next_z_rl"][bootstrap], batch["next_proprio"][bootstrap],
+                            batch["next_ref_chunk"][bootstrap],
+                        )
+                        next_action_mean = clamp_actor_action(next_action_mean, args.actor_action_limit)
+                        next_action = clamp_actor_action(
+                            sample_fixed_std_action(next_action_mean, next_action_std),
+                            args.actor_action_limit,
+                        )
+                        if action_transform is not None:
+                            next_action = action_transform(
+                                next_action,
+                                batch["next_execution_state"][bootstrap],
+                                batch["valid_mask"][bootstrap],
+                            )
+                        else:
+                            next_action = next_action.masked_fill(
+                                ~batch["valid_mask"][bootstrap].bool().unsqueeze(-1), 0.0,
+                            )
+                        target_q[bootstrap] = critic_target.q_min(
+                            batch["next_z_rl"][bootstrap], critic_proprio(batch, next_state=True)[bootstrap], next_action,
+                        )
                     chunk_return, bootstrap_discount = discounted_chunk_return(
                         batch["rewards"], batch["valid_mask"], args.discount
                     )
@@ -2738,7 +3674,9 @@ def main():
                     # target critic can never bootstrap Q values into the
                     # hundreds (deadly-triad overestimation spiral).
                     td_target = td_target.clamp(min=-2.0, max=2.0)
-                q1, q2 = critic(batch["z_rl"], batch["proprio"], batch["action_chunk"])
+                q1, q2 = critic(
+                    batch["z_rl"], critic_proprio(batch), batch["action_chunk"]
+                )
                 critic_loss = F.mse_loss(q1, td_target) + F.mse_loss(q2, td_target)
                 rew_mask = batch["rewards"].amax(dim=-1) > 0.0
                 n_rew = int(rew_mask.sum().item())
@@ -2765,41 +3703,49 @@ def main():
                 # TD error cannot destabilize the twin critics in one step.
                 torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=10.0)
                 critic_optimizer.step()
+                critic_updates += 1
+                if action_transform is not None:
+                    aligned_critic_updates += 1
 
                 # ── Actor update (paper: two critic updates per actor update) ──
                 if total_updates % args.critic_per_actor == 0:
-                    actor_ref_chunk = batch["ref_chunk"]
-                    if args.reference_dropout > 0.0:
-                        drop_ref = (
-                            torch.rand(batch["ref_chunk"].shape[0], device=device)
-                            < args.reference_dropout
-                        )
-                        actor_ref_chunk = torch.where(
-                            drop_ref.view(-1, 1, 1),
-                            torch.zeros_like(batch["ref_chunk"]),
-                            batch["ref_chunk"],
-                        )
-                    action_mean, action_std = actor(
-                        batch["z_rl"], batch["proprio"],
-                        actor_ref_chunk, training=True,
+                    # The takeover gate compares the actor used at execution
+                    # time against the same full VLA reference. Reference
+                    # dropout remains a training regularizer for the actor
+                    # loss, but must not make the gate itself stochastic.
+                    _gate_mean, gate_action = sample_training_proposal(
+                        actor, batch, 0.0, args.actor_action_limit,
                     )
-                    sampled_action = sample_fixed_std_action(action_mean, action_std)
 
+                    # Replay zero-pads unexecuted rows in partial terminal chunks.
+                    # BC ignores those rows, so Q must see the same padding;
+                    # otherwise the actor can increase Q without a BC penalty
+                    # by driving the unexecuted actions arbitrarily far away.
+                    critic_action_value = critic_action(batch, gate_action)
                     with frozen_parameters(critic):
                         actor_q = critic.q_min(
-                            batch["z_rl"].detach(), batch["proprio"], sampled_action
+                            batch["z_rl"].detach(), critic_proprio(batch), critic_action_value
                         ).mean()
+                        reference_q = critic.q_min(
+                            batch["z_rl"].detach(), critic_proprio(batch),
+                            critic_action(batch, batch["ref_chunk"]),
+                        ).mean()
+                    actor_advantage = actor_q - reference_q
+                    latest_actor_advantage = float(actor_advantage.detach())
                     rl_stats["actor_q"].append(float(actor_q.detach()))
 
-                    source_chunk = batch["source_chunk"]
+                    action_mean, sampled_action = sample_training_proposal(
+                        actor, bc_batch, args.reference_dropout, args.actor_action_limit,
+                    )
+                    source_chunk = bc_batch["source_chunk"]
                     human_mask = (
                         (source_chunk == int(TransitionSource.HUMAN))
                         | (source_chunk == int(TransitionSource.MIXED))
                     )
-                    valid_mask_f = batch["valid_mask"].float()
+                    valid_mask_f = bc_batch["valid_mask"].float()
 
                     bc_target = torch.where(
-                        human_mask.unsqueeze(-1), batch["action_chunk"], batch["ref_chunk"]
+                        human_mask.unsqueeze(-1), bc_batch["requested_chunk"], bc_batch["ref_chunk"]
                     )
                     bc_error = (sampled_action - bc_target).pow(2).mean(dim=-1)
                     bc_penalty = (bc_error * valid_mask_f).sum() / valid_mask_f.sum().clamp_min(1.0)
@@ -2825,6 +3771,7 @@ def main():
                     actor_optimizer.zero_grad(set_to_none=True)
                     actor_loss.backward()
                     actor_optimizer.step()
+                    actor_updates += 1
 
                     polyak_update(actor, actor_target, args.target_tau)
                     polyak_update(critic, critic_target, args.target_tau)
@@ -2840,6 +3787,8 @@ def main():
                     "td_max": float(td_target.max()),
                     "td_err": float(critic_loss.detach()),
                     "actorQ": float(actor_q.detach()) if actor_q is not None else float("nan"),
+                    "referenceQ": float(reference_q.detach()) if actor_q is not None else float("nan"),
+                    "actorAdv": float(actor_advantage.detach()) if actor_q is not None else float("nan"),
                     "bc": float(bc_penalty.detach()) if bc_penalty is not None else float("nan"),
                     "delta": float(delta_penalty.detach()) if delta_penalty is not None else float("nan"),
                     "n_rew": float(n_rew),
@@ -2851,14 +3800,20 @@ def main():
 
         def training_worker() -> None:
             while not training_stop.is_set() and not SHUTDOWN and not EMERGENCY_STOP:
+                if planner is not None and planner.busy.is_set():
+                    training_stop.wait(0.002)
+                    continue
                 if args.vla_only or completed_episode < args.warmup_episodes:
                     time.sleep(0.05)
                     continue
                 if len(buffer) < args.batch_size:
                     time.sleep(0.05)
                     continue
-                # Paper uses UTD=5: limit total updates to 5 per transition added.
-                if total_updates >= args.utd_ratio * replay.stats()["adds_total"]:
+                # Legacy BC-only rows must not grant a fresh UTD budget for
+                # repeatedly fitting a handful of newly aligned transitions.
+                used_updates = aligned_critic_updates if action_transform is not None else total_updates
+                added = replay.stats()["execution_adds_total" if action_transform is not None else "adds_total"]
+                if used_updates >= args.utd_ratio * added:
                     time.sleep(0.01)
                     continue
                 try:
@@ -2866,6 +3821,12 @@ def main():
                         # Streaming metrics log: one rolling-average line per
                         # metrics_log_every updates (tail-friendly).
                         if total_updates % args.metrics_log_every == 0:
+                            logger.info(
+                                "[RL] critic_updates=%d | actor_updates=%d | aligned_critic_updates=%d | "
+                                "actor_gate_advantage=%s",
+                                critic_updates, actor_updates, aligned_critic_updates,
+                                "-" if latest_actor_advantage is None else f"{latest_actor_advantage:.5f}",
+                            )
                             write_metrics_line()
                     time.sleep(0.001)
                 except Exception:
@@ -2932,6 +3893,13 @@ def main():
                 try:
                     now = time.monotonic()
                     leader_mirror_heartbeat = now
+                    if hardware is not None:
+                        requested = (human_active or positioning_active
+                                     or (takeover is not None and takeover.pending)
+                                     or teleop.takeover_request_pending or HIL_TOGGLE_REQUESTED)
+                        hardware.update_leader(requested, None)
+                        time.sleep(mirror_dt)
+                        continue
                     if (
                         human_active
                         or positioning_active
@@ -3057,24 +4025,10 @@ def main():
             )
             critical_frames_dir.mkdir(parents=True, exist_ok=True)
             logger.info("Critical transition key frames will be saved to %s", critical_frames_dir)
-        critical_detector = None
-        if args.auto_critical:
-            from lerobot.policies.pi05_rlt.critical import CriticalPhaseDetector
-            critical_detector = CriticalPhaseDetector(
-                args.critical_classifier,
-                device,
-                threshold_on=args.auto_critical_threshold_on,
-                threshold_off=args.auto_critical_threshold_off,
-                smooth_steps=args.auto_critical_smooth_steps,
-                min_on_chunks=args.auto_critical_min_on_chunks,
-            )
-            logger.info(
-                "Auto critical-phase detection active (on>=%.2f, off<=%.2f, smooth=%d chunks).",
-                args.auto_critical_threshold_on, args.auto_critical_threshold_off,
-                args.auto_critical_smooth_steps,
-            )
-
-        for episode in range(start_episode, args.max_episodes + 1):
+        # `episode` counts retained episodes.  A discarded/skipped attempt
+        # leaves it unchanged so --max_episodes means accepted episodes.
+        episode = start_episode
+        while episode <= args.max_episodes:
             if SHUTDOWN or EMERGENCY_STOP:
                 break
 
@@ -3127,6 +4081,7 @@ def main():
             SKIP_EPISODE = False  # Reset skip flag at start of episode
             FINISH_EPISODE = False  # Reset early-finish flag at start of episode
             CRITICAL_PHASE_ACTIVE = False
+            CRITICAL_MANUAL_STOPPED = False
             episode_actor_executed = False  # whether the RL Actor took over execution this episode; reset every episode
             # NOTE: POSITION_TOGGLE_REQUESTED is intentionally NOT cleared here.
             # A 'p' pressed during the previous episode's tail (y/n prompt,
@@ -3134,13 +4089,17 @@ def main():
             # the next positioning phase below, so an operator press is never
             # silently swallowed.
             _last_critical_seen = False  # per-episode baseline; 'c' boundaries are detected by changes
-            _last_z_rl = None  # cached z_rl from the previous chunk (early auto-detection)
             _auto_fired_once = False  # single critical segment per episode: auto ON happened
+            if critical_detector is not None:
+                critical_detector.reset()
             _critical_sustained_steps = 0  # consecutive critical steps (actor takeover guard)
+            actor_control_active = False  # whether the Actor is currently sending control targets
             episode_transitions = []
             intervention_steps = 0
             source_counts = {s: 0 for s in TransitionSource}
             human_active = False
+            human_motion_started = False
+            human_motion_anchor: torch.Tensor | None = None
             hil_terminal_reward: float | None = None
             hil_terminal_requested = False
 
@@ -3157,12 +4116,9 @@ def main():
             hil_materialized: list[Transition] | None = None
             hil_materialization_error: Exception | None = None
 
-            # Actor per-step clamp accounting (reported in the episode summary).
-            actor_clamp_steps = 0
-            actor_clamp_max_delta = 0.0
-
             # Continuous critical-phase step log for stride-2 overlapping replay.
             episode_step_counter = 0
+            next_policy_tick: float | None = None
             critical_step_counter: int | None = None
             step_records: list[StepRecord] = []
             stride_snapshots: dict[int, DeferredBoundarySnapshot] = {}
@@ -3182,11 +4138,53 @@ def main():
                 if obs is None:
                     return None
                 try:
-                    state = obs_to_state_tensor(obs).to(device)
+                    state = obs_to_state_tensor(obs)
                 except ValueError as exc:
                     logger.error("Invalid follower observation at %s: %s", context, exc)
                     return None
                 return DeferredBoundarySnapshot(clone_observation(obs), state.detach().clone(), step_id)
+
+            def await_pi05_plan(step_id: int) -> PrefetchedPi05Plan | None:
+                """Wait without blocking takeover, feedback, preview or hold commands."""
+                started = time.monotonic()
+                while True:
+                    takeover.latch(teleop.consume_takeover_request())
+                    if (SHUTDOWN or EMERGENCY_STOP or SKIP_EPISODE or FINISH_EPISODE
+                            or takeover.pending or HIL_TOGGLE_REQUESTED):
+                        planner.invalidate()
+                        return None
+                    if time.monotonic() - started > args.inference_timeout_s:
+                        raise TimeoutError("Asynchronous pi0.5 plan exceeded inference_timeout_s")
+                    ready = planner.poll(step_id)
+                    if ready is not None:
+                        if time.monotonic() - ready.observed_at > args.inference_timeout_s:
+                            raise TimeoutError("Asynchronous pi0.5 reference observation is too old")
+                        planning_log.write(json.dumps({
+                            "kind": "plan", "episode": episode, "step": step_id,
+                            "source_step": ready.source_step,
+                            "inference_s": ready.inference_s,
+                            "wait_s": time.monotonic() - started,
+                            "reference_age_s": time.monotonic() - ready.observed_at,
+                            "rtc_prefix_steps": ready.rtc_prefix_steps,
+                            "rtc_delay": ready.rtc_delay,
+                        }) + "\n")
+                        return ready
+                    wait_obs = read_follower_observation("async planning wait")
+                    if wait_obs is None:
+                        return None
+                    if not planner.matches(step_id):
+                        planner.submit(
+                            wait_obs, obs_to_state_tensor(wait_obs),
+                            source_step=step_id, target_step=step_id,
+                        )
+                    # No extra policy steps enter replay while the next plan
+                    # is late. Keep the accepted target; never execute an old
+                    # plan's tail or generate catch-up commands.
+                    hold = (action_dict_to_tensor(last_valid_target, "planning hold")
+                            if last_valid_target is not None else obs_to_state_tensor(wait_obs))
+                    if send_validated_action(hold, "HOLD") is None:
+                        raise RuntimeError("Failed to hold the follower while waiting for pi0.5")
+                    time.sleep(min(target_dt, 0.02))
 
             def infer_boundary(
                 obs: dict, state: torch.Tensor, step_id: int,
@@ -3219,6 +4217,8 @@ def main():
                     collection_phase=collection_phase,
                     episode_id=episode,
                     step_id=step_id,
+                    execution_state=execution_state_from_observation(obs),
+                    measured_state=state[:rlt_config.state_dim].detach().cpu().clone(),
                 )
 
             def materialize_snapshot(snapshot: DeferredBoundarySnapshot) -> BoundaryContext:
@@ -3408,6 +4408,12 @@ def main():
                 POSITION_TOGGLE_REQUESTED = False
 
                 # Phase 1: direct-follow until the second 'p'.
+                if hardware is not None:
+                    previous_sequence = teleop.latest_sequence
+                    hardware.set_phase("position")
+                    fresh = teleop.wait_for_fresh_sample(0.25, after_sequence=previous_sequence, timeout_s=0.5)
+                    if fresh is None:
+                        raise RuntimeError("ARX positioning handoff produced no fresh leader feedback")
                 leader_now = teleop.latest_sample
                 pos_obs = read_follower_observation("positioning entry")
                 if pos_obs is None or leader_now is None or not leader_now.is_fresh(max_age_s=0.25):
@@ -3418,7 +4424,7 @@ def main():
                     POSITIONING_STATE = "off"
                 else:
                     try:
-                        follower_state = obs_to_state_tensor(pos_obs).to(device)
+                        follower_state = obs_to_state_tensor(pos_obs)
                         leader_pose = leader_action_to_tensor(leader_now.action)
                     except ValueError as exc:
                         logger.error("Positioning entry sample invalid: %s", exc)
@@ -3430,16 +4436,35 @@ def main():
                         POSITIONING_STATE = "active"
                         pos_step_start = time.time()
                         pos_status_cycle = 0
-                        logger.info(
-                            "Positioning active: follower mirrors leader + offset %s; "
-                            "press 'p' to finish.",
-                            pos_offset.tolist(),
-                        )
+                        if hardware is not None:
+                            logger.info(
+                                "Positioning active: BOTH arms are in gravity-compensated drag mode, "
+                                "including their grippers. Move either arm directly; press 'p' to finish."
+                            )
+                        else:
+                            logger.info(
+                                "Positioning active: follower mirrors leader + offset %s; "
+                                "press 'p' to finish.",
+                                pos_offset.tolist(),
+                            )
                         while positioning_active and not SHUTDOWN and not EMERGENCY_STOP:
                             if POSITION_TOGGLE_REQUESTED:
                                 POSITION_TOGGLE_REQUESTED = False
                                 positioning_active = False
                                 break
+                            if hardware is not None:
+                                positions = hardware.position_tick()
+                                pos_status_cycle += 1
+                                if pos_status_cycle % 50 == 0:
+                                    logger.info(
+                                        "Positioning live (manual drag): follower joints[rad]=%s | "
+                                        "leader gripper=%.1f mm | follower gripper=%.1f mm",
+                                        [round(float(v), 3) for v in positions["follower"]["position"][:6]],
+                                        positions["leader"]["position"][-1] * 1000,
+                                        positions["follower"]["position"][-1] * 1000,
+                                    )
+                                time.sleep(target_dt)
+                                continue
                             sample = teleop.wait_for_fresh_sample(
                                 max_age_s=0.25,
                                 after_sequence=pos_last_sequence,
@@ -3450,19 +4475,19 @@ def main():
                                 continue
                             pos_last_sequence = sample.sequence
                             try:
-                                target_deg = leader_action_to_tensor(sample.action) + pos_offset
+                                physical_target = leader_action_to_tensor(sample.action) + pos_offset
                             except ValueError as exc:
                                 logger.error("Invalid positioning leader target: %s", exc)
                                 break
-                            actual_target = send_validated_action(target_deg, "POSITION")
+                            actual_target = send_validated_action(physical_target, "POSITION")
                             if actual_target is None:
                                 SHUTDOWN = True
                                 break
                             pos_status_cycle += 1
                             if pos_status_cycle % 50 == 0:
                                 logger.info(
-                                    "Positioning live: leader seq=%d | leader[deg]=%s | "
-                                    "sent[deg]=%s",
+                                    "Positioning live: leader seq=%d | leader physical=%s | "
+                                    "sent physical=%s",
                                     sample.sequence,
                                     [round(float(v), 2) for v in leader_action_to_tensor(sample.action).tolist()],
                                     [round(float(v), 2) for v in actual_target.detach().cpu().tolist()],
@@ -3475,7 +4500,7 @@ def main():
                         POSITIONING_STATE = "off"
                         # Re-anchor the leader mirror to the positioned follower pose
                         # so the master mirrors the slave again after positioning.
-                        if last_valid_target is not None:
+                        if hardware is None and last_valid_target is not None:
                             mirror_follower_to_leader(last_valid_target)
                         if SHUTDOWN or EMERGENCY_STOP:
                             break
@@ -3483,40 +4508,75 @@ def main():
                             "Positioning finished; starting the VLA episode from the positioned pose."
                         )
 
-            # Calculate steps per block: use actor_execution_steps if set, otherwise full chunk
+            if hardware is not None:
+                hardware.set_phase("policy")
+
+            # Calculate real execution ticks per block. Dense-grid validation
+            # expands the ten model actions to an interpolated command window;
+            # its larger window length must also drive the episode budget.
             steps_per_block = rlt_config.n_action_steps_rl
             if args.actor_execution_steps > 0:
                 steps_per_block = min(args.actor_execution_steps, rlt_config.n_action_steps_rl)
+            if args.exec_grid_hz:
+                action_hz = float(hardware_config["action_hz"]) if hardware_config is not None else float(args.control_fps)
+                steps_per_block = resampled_chunk_length(
+                    rlt_config.n_action_steps_rl,
+                    source_hz=action_hz,
+                    target_hz=float(args.exec_grid_hz),
+                )
             max_rollout_blocks = args.steps_per_episode // steps_per_block
             if max_rollout_blocks < 1:
                 raise ValueError(
                     "--steps_per_episode must be at least steps_per_block so every replay row is real."
                 )
-            if args.steps_per_episode % rlt_config.n_action_steps_rl:
+            if args.steps_per_episode % steps_per_block:
                 logger.warning(
-                    "Ignoring final %d control steps so every replay transition has a full real horizon.",
-                    args.steps_per_episode % rlt_config.n_action_steps_rl,
+                    "Ignoring final %d control steps so every execution window is complete.",
+                    args.steps_per_episode % steps_per_block,
                 )
-            # Synchronized HIL takeover offset (follower - leader, degrees). Set at
+            # Synchronized HIL takeover offset (follower - leader, backend physical
+            # units). Set at
             # each takeover; HUMAN targets are leader_pose + hil_offset so the
             # follower mirrors the human from its current pose without a freeze.
             hil_offset = torch.zeros(rlt_config.action_dim)
 
-            for step in range(max_rollout_blocks):
+            step = 0
+            horizon_extension_announced = False
+            while step < max_rollout_blocks or CRITICAL_PHASE_ACTIVE:
                 if SHUTDOWN or EMERGENCY_STOP or SKIP_EPISODE or FINISH_EPISODE:
                     break
+                if step >= max_rollout_blocks and not horizon_extension_announced:
+                    horizon_extension_announced = True
+                    message = (
+                        "[KEY] Critical phase still active at the episode horizon; "
+                        "continuing until it ends (f=finish episode, q=quit experiment)"
+                        if args.inference_only else
+                        "[KEY] Critical training phase continues beyond the episode horizon; "
+                        "c=close segment, f=finish and evaluate (h=HIL, q=quit experiment)"
+                    )
+                    logger.info(message)
+                    print(message, flush=True)
+                step += 1
                 step_start = time.time()
                 takeover.latch(teleop.consume_takeover_request())
 
                 if not human_active and (takeover.pending or HIL_TOGGLE_REQUESTED):
-                    hil_toggle_entry = HIL_TOGGLE_REQUESTED
-                    HIL_TOGGLE_REQUESTED = False
+                    if planner is not None:
+                        planner.invalidate()
+                    next_policy_tick = None
+                    hil_toggle_entry = consume_hil_toggle()
                     if hil_toggle_entry:
                         logger.info("HIL mode toggle: entering human control (explicit switch).")
                     if not teleop.leader_is_fresh(max_age_s=0.25):
                         logger.warning("HIL request remains pending until a fresh leader sample arrives.")
                     else:
                         logger.info("HIL takeover pending and leader fresh; attempting synchronized entry.")
+                        if hardware is not None:
+                            previous_sequence = teleop.latest_sequence
+                            hardware.set_phase("human")
+                            fresh = teleop.wait_for_fresh_sample(0.25, after_sequence=previous_sequence, timeout_s=0.5)
+                            if fresh is None:
+                                raise RuntimeError("ARX HIL handoff produced no fresh leader feedback")
                         snapshot = capture_boundary_snapshot("automatic HIL entry", episode_step_counter)
                         if snapshot is None:
                             break
@@ -3529,6 +4589,7 @@ def main():
                                 actions=list(pending_policy_window.actions),
                                 sources=list(pending_policy_window.sources),
                                 intervention_flags=list(pending_policy_window.intervention_flags),
+                                requested_actions=list(pending_policy_window.requested_actions),
                             ))
                             pending_policy_window = None
                         # Synchronized HIL entry: the leader and follower move
@@ -3547,10 +4608,18 @@ def main():
                             continue
                         leader_pose = leader_action_to_tensor(leader_now.action)
                         hil_offset = snapshot.state.detach().cpu() - leader_pose.detach().cpu()
+                        if hardware is not None:
+                            hil_offset[-1] = 0  # Preserve the SDK's full-close/full-open mapping.
+                        human_motion_anchor = leader_pose.detach().cpu().clone()
+                        human_motion_started = False
                         takeover.last_leader_sequence = leader_now.sequence - 1
                         # Entering HIL: the mirror thread switches to hold mode
                         # (goal = present, soft torque) so the leader neither drops
                         # nor fights the human. No torque-off here.
+                        if actor_control_active:
+                            actor_control_active = False
+                            logger.info("[KEY] Actor takeover STOPPED (human HIL takeover)")
+                            print("[KEY] Actor takeover STOPPED; human HIL active", flush=True)
                         human_active = True
                         human_boundary = snapshot
                         teleop.enter_human_mode(args.leader_hil_min_dwell_s)
@@ -3566,27 +4635,43 @@ def main():
                 force_resume = HIL_FORCE_RESUME or HIL_TOGGLE_REQUESTED
                 if force_resume:
                     HIL_FORCE_RESUME = False
-                    HIL_TOGGLE_REQUESTED = False
+                    if HIL_TOGGLE_REQUESTED:
+                        consume_hil_toggle()
                     logger.info("HIL force-resume by operator ('s'/'h' key); exiting human control.")
                 if human_active and (teleop.consume_resume_request() or force_resume):
+                    if hardware is not None:
+                        hardware.set_phase("idle")
                     # Wait for materialization to complete before resuming
                     if flush_deferred_hil_windows(wait=True):
                         human_active = False
+                        human_motion_started = False
+                        human_motion_anchor = None
                         human_boundary = None
                         teleop.exit_human_mode()
                         action_cache.clear()
+                        if planner is not None:
+                            planner.invalidate()
                         # Interventions are corrections: exit HIL and continue the
                         # episode. The terminal reward is judged at the normal
                         # episode-end prompt (y/n/d/q), not at HIL exit.
                         logger.info("HIL exited; policy replans and resumes (episode continues).")
+                        print("[KEY] HIL exited; policy resumed (episode continues)", flush=True)
                     else:
                         # Even if materialization failed, force resume policy
                         human_active = False
+                        human_motion_started = False
+                        human_motion_anchor = None
                         human_boundary = None
                         teleop.exit_human_mode()
                         action_cache.clear()
+                        if planner is not None:
+                            planner.invalidate()
                         deferred_windows.clear()
                         logger.warning("HIL materialization failed; forcing policy resume.")
+                        print("[KEY] HIL exited; policy resumed (episode continues)", flush=True)
+
+                    if hardware is not None:
+                        hardware.set_phase("policy")
 
                 if hil_terminal_requested:
                     break
@@ -3628,8 +4713,7 @@ def main():
                                 "[KEY] Critical phase transition saved (HIL): ep%d step%d %s (manual)",
                                 episode, episode_step_counter, direction,
                             )
-                        # Same terminal anchoring as the main toggle block: a
-                        # manual 'c' OFF during HIL is also the key-moment end.
+                        # Manual c OFF anchors the segment end during HIL too.
                         if direction == "off" and terminal_snapshot is None:
                             terminal_snapshot = capture_boundary_snapshot(
                                 "critical-phase terminal (off)", episode_step_counter,
@@ -3646,7 +4730,19 @@ def main():
                         _last_critical_seen = CRITICAL_PHASE_ACTIVE
 
                     human_actions: list[torch.Tensor] = []
-                    for _ in range(rlt_config.n_action_steps_rl):
+                    human_requests: list[torch.Tensor] = []
+                    human_resume_requested = False
+                    # The first samples after pressing 'h' are a handoff
+                    # interval.  They are intentionally consumed only to
+                    # advance the feedback sequence; no action step or replay
+                    # row is created until the operator has moved the arm.
+                    while len(human_actions) < rlt_config.n_action_steps_rl:
+                        if SHUTDOWN or EMERGENCY_STOP:
+                            break
+                        if HIL_FORCE_RESUME or HIL_TOGGLE_REQUESTED or teleop.consume_resume_request():
+                            HIL_FORCE_RESUME = True
+                            human_resume_requested = True
+                            break
                         sample = teleop.wait_for_fresh_sample(
                             max_age_s=0.25,
                             after_sequence=takeover.last_leader_sequence,
@@ -3656,9 +4752,41 @@ def main():
                             logger.warning("Stopping HUMAN chunk: no fresh unexecuted leader sample arrived.")
                             break
                         try:
-                            # Synchronized HIL: follower tracks leader + takeover
-                            # offset so both arms move together with no jump.
-                            target_deg = leader_action_to_tensor(sample.action) + hil_offset
+                            leader_target = leader_action_to_tensor(sample.action)
+                        except ValueError as exc:
+                            logger.error("Invalid leader target: %s", exc)
+                            SHUTDOWN = True
+                            break
+                        if not human_motion_started:
+                            if human_motion_anchor is None:
+                                human_motion_anchor = leader_target.detach().cpu().clone()
+                            joint_delta = float((leader_target[:6] - human_motion_anchor[:6]).abs().max())
+                            gripper_delta = float(abs(leader_target[-1] - human_motion_anchor[-1]))
+                            if joint_delta < 0.005 and gripper_delta < 0.001:
+                                # Keep this sample out of episode_step_counter,
+                                # StepRecord and replay.  The worker remains in
+                                # drag/hold mode and the next fresh sample is
+                                # checked against the same handoff anchor.
+                                continue
+                            human_motion_started = True
+                            motion_snapshot = capture_boundary_snapshot(
+                                "HIL first movement", episode_step_counter,
+                            )
+                            if motion_snapshot is not None:
+                                start_snapshot = motion_snapshot
+                                human_boundary = motion_snapshot
+                            logger.info(
+                                "HIL motion detected; recording starts after handoff dwell "
+                                "(joint delta %.4f rad, gripper delta %.4f m).",
+                                joint_delta, gripper_delta,
+                            )
+                        try:
+                            # Dual-arm HIL sends the leader pose plus the
+                            # synchronized offset.  Single-arm HIL is already
+                            # physically moved by the operator, so its sample
+                            # is measured state and must never be sent back as
+                            # a target to the same CAN controller.
+                            physical_target = leader_target + hil_offset
                         except ValueError as exc:
                             logger.error("Invalid leader target: %s", exc)
                             SHUTDOWN = True
@@ -3676,12 +4804,19 @@ def main():
                                         with stride_mt_lock:
                                             stride_pending.append(stride_snapshot)
                                         start_stride_materialization()
-                        actual_target = send_validated_action(target_deg, "HUMAN")
-                        if actual_target is None:
-                            SHUTDOWN = True
-                            break
-                        normalized_action = normalize_action(actual_target.to(device))
+                        if single_arm_hil:
+                            actual_target = leader_target
+                        else:
+                            actual_target = send_validated_action(physical_target, "HUMAN")
+                            if actual_target is None:
+                                SHUTDOWN = True
+                                break
+                        normalized_action = normalize_action(actual_target)
+                        normalized_request = normalize_action(
+                            leader_target if single_arm_hil else physical_target
+                        )
                         human_actions.append(normalized_action)
+                        human_requests.append(normalized_request)
                         intervention_steps += 1
                         if CRITICAL_PHASE_ACTIVE:
                             if critical_step_counter is None:
@@ -3694,6 +4829,7 @@ def main():
                                 source=int(TransitionSource.HUMAN),
                                 intervention=True,
                                 step_id=episode_step_counter,
+                                requested_action=normalized_request,
                             ))
                             critical_step_counter += 1
                         episode_step_counter += 1
@@ -3702,25 +4838,46 @@ def main():
                             time.sleep(remaining_dt)
                         step_start = time.time()
 
-                    if SHUTDOWN or not human_actions:
+                    if SHUTDOWN:
                         break
+                    if human_resume_requested:
+                        # Leave HIL resolution to the normal top-of-loop path;
+                        # no partial static handoff is emitted as replay.
+                        continue
+                    if not human_actions:
+                        # A clean 's'/'h' during the handoff may leave no human
+                        # action at all.  Keep the episode alive and let the
+                        # resume branch above switch back to policy.
+                        continue
                     end_snapshot = capture_boundary_snapshot("HIL chunk boundary", episode_step_counter)
                     if end_snapshot is None:
                         break
-                    if collect_hil_data and CRITICAL_PHASE_ACTIVE:
+                    if collect_hil_data and CRITICAL_PHASE_ACTIVE and not args.exec_grid_hz:
                         deferred_windows.append(DeferredExecutionWindow(
                             start=start_snapshot,
                             end=end_snapshot,
                             actions=human_actions,
                             sources=[int(TransitionSource.HUMAN)] * len(human_actions),
                             intervention_flags=[True] * len(human_actions),
+                            requested_actions=human_requests,
                         ))
                     human_boundary = end_snapshot
                     source_counts[TransitionSource.HUMAN] += len(human_actions)
                     continue
 
                 # ── Autonomous boundary inference and execution ──
-                _auto_triggered = False  # per-boundary: did the early auto-detector fire?
+                prefetched_plan = None
+                if planner is not None:
+                    try:
+                        prefetched_plan = await_pi05_plan(episode_step_counter)
+                    except (RuntimeError, ValueError, TimeoutError) as exc:
+                        logger.exception("Asynchronous pi0.5 planning failed: %s", exc)
+                        SHUTDOWN = True
+                        break
+                    if prefetched_plan is None:
+                        if observation_faulted or SHUTDOWN or EMERGENCY_STOP:
+                            break
+                        continue
                 obs = read_follower_observation("autonomous pre-action")
                 if obs is None:
                     break
@@ -3739,83 +4896,86 @@ def main():
                         logger.warning("Debug image save failed: %s", _exc)
                 try:
                     state_tensor = obs_to_state_tensor(obs).to(device)
-                    # Early detection BEFORE the (blocking) inference: use the
-                    # previous chunk's cached z_rl + current proprio so the
-                    # auto-detector fires before the inference stall, removing
-                    # ~0.5-1 s of detection lag (the boundary inference waits
-                    # for the diffusion to finish).
-                    # Gating: skip the start-of-episode delay window, and once
-                    # the single critical segment has run its course (auto ON ->
-                    # OFF), do not auto-ON again in this episode.
-                    _auto_detection_armed = (
-                        critical_detector is not None
-                        and episode_step_counter >= args.auto_critical_start_delay_steps
-                        and not (
-                            args.auto_critical_once
-                            and _auto_fired_once
-                            and not CRITICAL_PHASE_ACTIVE
-                        )
-                        and time.time() - CRITICAL_MANUAL_OVERRIDE_AT >= args.auto_critical_override_cooldown
+                    rtc_leftover = (
+                        action_cache.remaining_raw_actions()
+                        if args.rtc_enabled else None
                     )
-                    if _auto_detection_armed and _last_z_rl is not None:
-                        desired = critical_detector.update(
-                            _last_z_rl,
-                            normalize_state(state_tensor)[:rlt_config.state_dim].detach().cpu().numpy(),
-                        )
-                        if desired is not None and desired != CRITICAL_PHASE_ACTIVE:
-                            CRITICAL_PHASE_ACTIVE = desired
-                            _auto_triggered = True
-                            if desired:
-                                _auto_fired_once = True
-                            logger.info(
-                                "[KEY] Auto critical phase %s (early, P(critical)=%.3f)",
-                                "STARTED" if desired else "STOPPED",
-                                critical_detector.last_probability,
-                            )
-                    # --replan_every_window (default ON): force a fresh 50-step
-                    # plan at EVERY 10-step window for BOTH the frozen VLA and
-                    # the RL actor, so the reference chunk is always sampled
-                    # from the CURRENT observation (paper Algorithm 1:
-                    # a~t:t+C-1 ~ pi_vla(st)). Cost: each replan runs the full
-                    # 10-step flow-matching diffusion of the 3B model (~1-5 s),
-                    # so the robot moves 0.33 s then waits for the next plan —
-                    # the stop-and-go cadence. Pass
-                    # --no-replan_every_window to keep the cached 50-step chunk
-                    # and replan only when it is exhausted (lerobot-record
-                    # cadence: smooth, but references become chunk-continuation).
                     if args.replan_every_window:
                         action_cache.clear()
-                    # Replan only when the cached VLA chunk can no longer serve
-                    # the next 10-step window (≈ every 50 control steps = 1.67 s
-                    # at 30 Hz) — i.e. full-chunk execution, exactly like
-                    # lerobot-record. Replanning at every window (every 0.33 s)
-                    # forced each boundary through the full 10-step flow-matching
-                    # diffusion of the 3B model (~1-5 s), so pure-VLA motion froze
-                    # between chunks (0.33 s of motion followed by 1-5 s of waiting). While the
-                    # cached chunk still covers the window, reuse its raw actions
-                    # and only recompute z_rl for the CURRENT observation
-                    # (extract_embeddings = 1 cheap LM forward; the image-only
-                    # prefix hidden states depend on the images, not on the
-                    # action values, so any aligned sub-chunk works).
-                    # The leftover-reuse path relies on extract_embeddings accepting
-                    # action blocks shorter than chunk_size (the vla_compat noise and
-                    # the embed_suffix attention-mask length were fixed accordingly),
-                    # so Stage 2 keeps its original logic here.
+                    # Keep C=10 and use the first C contiguous actions of a new
+                    # reference at each boundary. Async planning already returns
+                    # z_rl with its actions, so avoid a second visual/prefix pass.
                     needs_replan = (
                         action_cache.raw_actions is None
                         or action_cache.next_index + rlt_config.n_action_steps_rl
                         > action_cache.raw_actions.shape[1]
                     )
-                    if needs_replan:
+                    # Keep the full policy chunk around until the execution
+                    # slice is chosen.  Zero-phase FIR has edge transients; if
+                    # it is applied after slicing, the first/last executed
+                    # targets are biased in opposite directions at every window
+                    # boundary.  ``vla_only`` smooths the full chunk below, so
+                    # the executed 10-action slice sits in the filter interior.
+                    full_plan_actions = None
+                    full_plan_start = 0
+                    if prefetched_plan is not None:
+                        z_rl = prefetched_plan.z_rl.to(device=device)
+                        # The prefetched chunk was observed `lead` control steps
+                        # ago.  Executing its head replays stale targets and
+                        # shows up as a ~0.15 rad jump at every window boundary;
+                        # start at the action that corresponds to "now".
+                        plan_age_ticks = max(
+                            0,
+                            int(prefetched_plan.target_step) - int(prefetched_plan.source_step),
+                        )
+                        # A prefetched plan is produced on the model action
+                        # axis, while source/target steps count points on the
+                        # current execution timeline.  Dense-grid validation
+                        # deliberately makes that timeline explicit: one
+                        # logical tick consumes one interpolated grid point,
+                        # even though the transport still submits commands at
+                        # control_fps.
+                        execution_grid_hz = float(args.exec_grid_hz or args.control_fps)
+                        action_hz = float(hardware_config["action_hz"]) if hardware_config is not None else float(args.control_fps)
+                        plan_age = model_action_count_for_ticks(
+                            plan_age_ticks,
+                            tick_hz=execution_grid_hz,
+                            action_hz=action_hz,
+                        )
+                        if plan_age + rlt_config.n_action_steps_rl > prefetched_plan.actions.shape[1]:
+                            logger.warning(
+                                "Discarding stale/short prefetched plan at step %d: age=%d raw actions=%d horizon=%d",
+                                prefetched_plan.target_step, plan_age, prefetched_plan.actions.shape[1],
+                                rlt_config.n_action_steps_rl,
+                            )
+                            prefetched_plan = None
+                        else:
+                            action_cache.refresh(
+                                prefetched_plan.actions[:, plan_age:], z_rl.detach(), rlt_config.action_dim,
+                            )
+                            full_plan_actions = prefetched_plan.actions
+                            full_plan_start = plan_age
+                            if plan_age:
+                                logger.debug("Skipped %d stale prefetched action(s) at step %d",
+                                             plan_age, prefetched_plan.target_step)
+                    if prefetched_plan is None and needs_replan:
                         raw_actions, z_rl = run_pi05_inference(
-                            obs, state_tensor, prev_chunk_left_over=None, inference_delay=0,
+                            obs, state_tensor,
+                            prev_chunk_left_over=rtc_leftover,
+                            inference_delay=0,
+                            realtime=True,
                         )
                         action_cache.refresh(raw_actions.detach(), z_rl.detach(), rlt_config.action_dim)
-                    else:
+                        full_plan_actions = raw_actions
+                        full_plan_start = 0
+                    elif prefetched_plan is None:
                         cached_leftover = action_cache.remaining_raw_actions()
+                        full_plan_actions = action_cache.raw_actions
+                        full_plan_start = action_cache.next_index
                         _, z_rl = run_pi05_inference(
                             obs, state_tensor,
                             raw_actions_for_embedding=cached_leftover,
+                            realtime=True,
                         )
                 except (KeyError, ValueError, RuntimeError) as exc:
                     # Print the full stack: the message alone does not locate a tensor
@@ -3826,21 +4986,25 @@ def main():
                     SHUTDOWN = True
                     break
                 vla_actions, action_index, _ = action_cache.take(rlt_config.n_action_steps_rl)
-                _last_z_rl = z_rl.detach().cpu().numpy().squeeze()
 
                 # ── Critical-phase classifier bookkeeping (auto-detection + logging) ──
-                auto_triggered = _auto_triggered
+                auto_triggered = False
                 if (
-                    _auto_detection_armed
-                    and critical_detector is not None
-                    and not auto_triggered
+                    critical_detector is not None
+                    and episode_step_counter >= args.auto_critical_start_delay_steps
+                    # During training the classifier only starts the segment.
+                    # Keep collecting through retries/HIL until the operator
+                    # stops the segment, so a probability dip cannot move the terminal.
+                    and (args.inference_only or not CRITICAL_PHASE_ACTIVE)
+                    and not CRITICAL_MANUAL_STOPPED
+                    and not (args.auto_critical_once and _auto_fired_once and not CRITICAL_PHASE_ACTIVE)
                     and time.time() - CRITICAL_MANUAL_OVERRIDE_AT >= args.auto_critical_override_cooldown
                 ):
-                    # First chunk of the episode (no cached z_rl yet): fall back
-                    # to a post-inference check with the fresh z_rl.
+                    # Once per boundary, using token and proprio from the same
+                    # observation that supplies the VLA reference and Actor.
                     desired = critical_detector.update(
-                        _last_z_rl,
-                        normalize_state(state_tensor)[:rlt_config.state_dim].detach().cpu().numpy(),
+                        z_rl.detach().cpu().numpy().squeeze(),
+                        state_tensor[:rlt_config.state_dim].detach().cpu().numpy(),
                     )
                     if desired is not None and desired != CRITICAL_PHASE_ACTIVE:
                         CRITICAL_PHASE_ACTIVE = desired
@@ -3851,6 +5015,11 @@ def main():
                             "[KEY] Auto critical phase %s (P(critical)=%.3f)",
                             "STARTED" if desired else "STOPPED",
                             critical_detector.last_probability,
+                        )
+                        print(
+                            "[KEY] Auto critical phase %s (P(critical)=%.3f)"
+                            % ("STARTED" if desired else "STOPPED", critical_detector.last_probability),
+                            flush=True,
                         )
                 if CRITICAL_PHASE_ACTIVE != _last_critical_seen:
                     direction = "on" if CRITICAL_PHASE_ACTIVE else "off"
@@ -3874,12 +5043,8 @@ def main():
                             "[KEY] Critical phase transition saved: ep%d step%d %s (%s)",
                             episode, episode_step_counter, direction, source,
                         )
-                    # Anchor the terminal (reward) observation to the moment the
-                    # critical phase ENDS — the key-moment boundary — instead of
-                    # the episode end, which trails it by the post-critical 'f'
-                    # tail (paper: terminal signal arrives at the end of the
-                    # critical phase). First off wins; queued for background
-                    # materialization so it is ready by the y/n prompt.
+                    # Training OFF comes only from manual c; detector OFF can
+                    # still end inference. Both anchor the true segment end.
                     if direction == "off" and terminal_snapshot is None:
                         terminal_snapshot = capture_boundary_snapshot(
                             "critical-phase terminal (off)", episode_step_counter,
@@ -3899,7 +5064,7 @@ def main():
                         episode,
                         episode_step_counter,
                         z_rl.detach().cpu().numpy().squeeze(),
-                        normalize_state(state_tensor)[:rlt_config.state_dim].detach().cpu().numpy(),
+                        state_tensor[:rlt_config.state_dim].detach().cpu().numpy(),
                     )
 
                 # Paper Eq. (5): reference = first C contiguous VLA actions so the
@@ -3909,7 +5074,7 @@ def main():
                     action_dim=rlt_config.action_dim,
                     start_index=action_index,
                     num_steps=rlt_config.n_action_steps_rl,
-                )
+                ).to(device)
                 boundary = BoundaryContext(
                     z_rl=z_rl.detach(),
                     proprio=normalize_state(state_tensor)[:rlt_config.state_dim].detach(),
@@ -3917,12 +5082,15 @@ def main():
                     collection_phase=collection_phase,
                     episode_id=episode,
                     step_id=episode_step_counter,
+                    execution_state=execution_state_from_observation(obs),
+                    measured_state=state_tensor[:rlt_config.state_dim].detach().cpu().clone(),
                 )
-                if pending_policy_window is not None and CRITICAL_PHASE_ACTIVE:
+                if pending_policy_window is not None:
                     episode_transitions.append(build_transition(
                         pending_policy_window, boundary,
                         horizon=rlt_config.n_action_steps_rl,
                         action_dim=rlt_config.action_dim,
+                        terminal=not CRITICAL_PHASE_ACTIVE,
                     ))
                     pending_policy_window = None
 
@@ -3940,8 +5108,13 @@ def main():
                     or args.vla_only
                     or episode <= args.warmup_episodes
                     # inference_only has no update counter, so the Actor may take over as soon as it is enabled
-                    or (total_updates < args.actor_start_updates and not args.inference_only)
+                    or ((aligned_critic_updates if action_transform is not None else total_updates)
+                        < args.actor_start_updates and not args.inference_only)
                     or not ACTOR_ENABLED
+                    or (not args.inference_only and (
+                        latest_actor_advantage is None
+                        or latest_actor_advantage <= args.actor_gate_advantage
+                    ))
                 ):
                     requested_actions = vla_actions
                     action_source = "VLA"
@@ -3956,12 +5129,16 @@ def main():
                                 # Deterministic execution: no sampling jitter.
                                 requested_actions = action_mean
                                 if args.actor_noise_std > 0:
-                                    # Small exploration noise on top of the mean.
-                                    requested_actions = requested_actions + (
-                                        torch.randn_like(requested_actions) * args.actor_noise_std
+                                    # One exploration vector per chunk keeps the
+                                    # trajectory coherent at the 30 Hz boundary.
+                                    requested_actions = add_chunk_noise(
+                                        requested_actions, args.actor_noise_std,
                                     )
                             else:
                                 requested_actions = sample_fixed_std_action(action_mean, action_std)
+                            requested_actions = clamp_actor_action(
+                                requested_actions, args.actor_action_limit,
+                            )
                             if args.actor_execution_scale != 1.0:
                                 requested_actions = requested_actions * args.actor_execution_scale
                     action_source = "ACTOR"
@@ -3973,20 +5150,130 @@ def main():
                         logger.debug("Actor residual correction: %.4f (scale=%.3f)", residual, actor._residual_scale)
 
                 window = ExecutionWindow(boundary)
+                # c takes effect at a window boundary. Record the entire last
+                # active window, including actions already committed to it.
+                window_critical_active = CRITICAL_PHASE_ACTIVE and not args.exec_grid_hz
                 takeover_during_chunk = False
                 # Determine how many steps to execute before re-planning
                 steps_to_execute = rlt_config.n_action_steps_rl
                 if action_source == "ACTOR" and args.actor_execution_steps > 0:
                     steps_to_execute = min(args.actor_execution_steps, rlt_config.n_action_steps_rl)
+                # All per-tick work below is on CPU. In particular, do not copy
+                # an individual waypoint or replay snapshot from CUDA while the
+                # next diffusion is queued on the same device.
+                #
+                # Zero-phase FIR has edge transients.  Smoothing only the ten
+                # executed actions puts the first and last targets on opposite
+                # filter edges, which biases them in opposite directions at
+                # every window boundary.  In vla-only execution, smooth the full
+                # policy chunk first (the 10-action slice is then in the filter
+                # interior), matching pi0.5's full-chunk processing.  The
+                # training path keeps the per-window transform so Q targets stay
+                # consistent with AcceptedActionTransform.
+                full_chunk_smoothing = (
+                    bool(args.vla_only)
+                    and args.chunk_smooth_taps > 1
+                    and full_plan_actions is not None
+                    and full_plan_start + rlt_config.n_action_steps_rl
+                    <= full_plan_actions.shape[1]
+                )
+                action_hz_for_grid = (
+                    float(hardware_config["action_hz"])
+                    if hardware_config is not None else float(args.control_fps)
+                )
+                if full_chunk_smoothing:
+                    full_physical = unnormalize_action(full_plan_actions.detach().cpu())
+                    full_smoothed = smooth_actions_torch(
+                        full_physical, args.chunk_smooth_taps,
+                        joints=rlt_config.action_dim - 1,
+                    )
+                    model_head = full_smoothed[
+                        :, full_plan_start:full_plan_start + rlt_config.n_action_steps_rl
+                    ].clone()
+                    raw_head = model_head[0, :6]
+                    if args.exec_grid_hz:
+                        # pi0.5 resamples the whole 50-action chunk, then
+                        # executes a command slice starting at the plan age.
+                        # Slicing the 10-action window first and resampling it
+                        # shifts the phase by the plan-age rounding.
+                        grid_hz = float(args.exec_grid_hz)
+                        full_resampled = resample_chunk(
+                            full_smoothed, source_hz=action_hz_for_grid, target_hz=grid_hz,
+                        )
+                        window_len = resampled_chunk_length(
+                            rlt_config.n_action_steps_rl,
+                            source_hz=action_hz_for_grid, target_hz=grid_hz,
+                        )
+                        grid_start = command_index_for_model_step(
+                            full_plan_start, command_hz=grid_hz, action_hz=action_hz_for_grid,
+                        )
+                        grid_start = min(
+                            grid_start, max(0, full_resampled.shape[1] - window_len),
+                        )
+                        window_len = min(window_len, full_resampled.shape[1] - grid_start)
+                        requested_targets = full_resampled[
+                            :, grid_start:grid_start + window_len
+                        ].clone()
+                        steps_to_execute = window_len
+                    else:
+                        requested_targets = model_head
+                else:
+                    requested_targets = unnormalize_action(requested_actions.detach().cpu())
+                    # Same kernel runs inside the training-side execution
+                    # transform, so Q sees what the arm runs.
+                    requested_targets = smooth_actions_torch(
+                        requested_targets, args.chunk_smooth_taps,
+                        joints=rlt_config.action_dim - 1,
+                    )
+                    raw_head = requested_targets[0, :6]
+                    if args.exec_grid_hz:
+                        requested_targets = resample_chunk(
+                            requested_targets,
+                            source_hz=action_hz_for_grid,
+                            target_hz=float(args.exec_grid_hz),
+                        )
+                        steps_to_execute = int(requested_targets.shape[1])
+                if args.start_blend_steps > 0 and episode_step_counter == 0:
+                    if boundary.measured_state is None:
+                        raise RuntimeError("Start blending requires a physical boundary state")
+                    requested_targets = blend_start_targets(
+                        requested_targets,
+                        boundary.measured_state,
+                        int(args.start_blend_steps),
+                        joint_count=min(6, rlt_config.action_dim),
+                    )
+                if args.exec_grid_hz and plan_head_log is not None:
+                    plan_head_log.write(json.dumps({
+                        "episode_step": episode_step_counter,
+                        "source": action_source,
+                        "window_steps": steps_to_execute,
+                        "raw_head": [round(float(v), 4) for v in raw_head.flatten().tolist()],
+                        "resampled_head": [
+                            round(float(v), 4) for v in requested_targets[0, :6, 0].tolist()
+                        ],
+                        "resampled_j1_head": [
+                            round(float(v), 4) for v in requested_targets[0, :6, 1].tolist()
+                        ],
+                    }) + "\n")
+                    plan_head_log.flush()
+                window_raw_actions = action_cache.raw_actions.detach().cpu()
+                window_sent_at = []
+                execution_grid_hz = float(args.exec_grid_hz or args.control_fps)
+                # The loop still advances one point per control tick, so the
+                # inference lead is measured in control ticks, not grid points.
+                prefetch_at = (planner.prefetch_at(steps_to_execute, float(args.control_fps))
+                               if planner is not None else steps_to_execute)
                 for action_offset in range(steps_to_execute):
-                    takeover.latch(teleop.consume_takeover_request())
-                    if takeover.pending:
-                        takeover_during_chunk = True
-                        # Don't clear cache — keep raw actions for RTC
-                        # guidance on resume; just invalidate the cursor
-                        # so the next autonomous block replans.
+                    if SHUTDOWN or EMERGENCY_STOP or SKIP_EPISODE or FINISH_EPISODE:
                         break
-                    if CRITICAL_PHASE_ACTIVE:
+                    takeover.latch(teleop.consume_takeover_request())
+                    if takeover.pending or HIL_TOGGLE_REQUESTED:
+                        takeover_during_chunk = True
+                        if planner is not None:
+                            planner.invalidate()
+                        break
+                    stride_snapshot = None
+                    if window_critical_active:
                         if critical_step_counter is None:
                             critical_step_counter = 0
                         if critical_step_counter % replay_stride == 0:
@@ -3994,63 +5281,141 @@ def main():
                                 stride_snapshot = capture_boundary_snapshot(
                                     "stride boundary", episode_step_counter,
                                 )
-                                if stride_snapshot is not None and action_cache.raw_actions is not None:
-                                    stride_snapshot.raw_actions = action_cache.raw_actions.detach().cpu().clone()
+                                if stride_snapshot is not None:
+                                    stride_snapshot.raw_actions = window_raw_actions
                                     stride_snapshot.raw_action_index = action_index + action_offset
                                 if stride_snapshot is not None:
                                     stride_snapshots[critical_step_counter] = stride_snapshot
                                     with stride_mt_lock:
                                         stride_pending.append(stride_snapshot)
                                     start_stride_materialization()
-                    target_deg = unnormalize_action(requested_actions[0, action_offset])
-                    # ACTOR-only per-step angle limit, relative to the last
-                    # commanded pose. VLA / HUMAN / RESET are never clamped here
-                    # (the driver-level max_relative_target is the only all-source
-                    # clamp, and it is normally disabled).
-                    if action_source == "ACTOR" and actor_relative_limit is not None and last_valid_target is not None:
-                        ref = action_dict_to_tensor(last_valid_target, "actor clamp reference").to(target_deg.device)
-                        clamped = target_deg.clone()
-                        for _joint_idx, _joint_name in enumerate(JOINT_NAMES):
-                            _lim = actor_relative_limit.get(_joint_name)
-                            if _lim is None:
-                                continue
-                            _lo = ref[_joint_idx] - _lim
-                            _hi = ref[_joint_idx] + _lim
-                            clamped[_joint_idx] = torch.clamp(target_deg[_joint_idx], _lo, _hi)
-                        if not torch.equal(clamped, target_deg):
-                            _clamp_delta = float((clamped - target_deg).abs().max())
-                            actor_clamp_steps += 1
-                            actor_clamp_max_delta = max(actor_clamp_max_delta, _clamp_delta)
-                            logger.debug("Actor action clamped by per-step limit (max delta %.1f deg).",
-                                         _clamp_delta)
-                        target_deg = clamped
-                    actual_target = send_validated_action(target_deg, action_source)
+                    if planner is not None and action_offset >= prefetch_at:
+                        # The plan is consumed at the next window boundary, after
+                        # all remaining ticks of this window have executed.
+                        # ``episode_step_counter`` already includes this tick's
+                        # offset; adding ``action_offset`` again made poll()
+                        # reject every prefetch and fall back to an unguided plan.
+                        target_step = episode_step_counter + (steps_to_execute - action_offset)
+                        if not planner.matches(target_step):
+                            planning_obs = (stride_snapshot.observation if stride_snapshot is not None
+                                            else read_follower_observation("async prefetch"))
+                            if planning_obs is None:
+                                break
+                            rtc_prefix = None
+                            rtc_delay = 0
+                            rtc_end = None
+                            if args.rtc_enabled and action_cache.raw_actions is not None:
+                                action_hz = (
+                                    float(hardware_config["action_hz"])
+                                    if hardware_config is not None else float(args.control_fps)
+                                )
+                                # action_offset counts the interpolated execution
+                                # grid points.  Map the command tick to the
+                                # model action being executed, matching pi0.5's
+                                # model_index_for_command.  The RTC prefix must
+                                # start at the action currently on the arm, not
+                                # the next one; rounding shifted it by one on
+                                # half of the grid.
+                                grid_hz = execution_grid_hz
+                                ticks_per_action = max(grid_hz / action_hz, 1e-9)
+                                chunk_offset = action_index + model_action_index_for_command(
+                                    action_offset, command_hz=grid_hz, action_hz=action_hz,
+                                )
+                                chunk_offset = min(chunk_offset, action_cache.raw_actions.shape[1] - 1)
+                                candidate = action_cache.raw_actions[:, chunk_offset:]
+                                if candidate.shape[1] >= 1:
+                                    rtc_prefix = candidate.clone()
+                                    rtc_delay = int(math.ceil(
+                                        (steps_to_execute - action_offset) / ticks_per_action - 1e-9
+                                    ))
+                                    rtc_delay = min(rtc_delay, rtc_prefix.shape[1] - 1)
+                                    # Official RTC: prefix attention ends at
+                                    # H - s, not at delay + horizon.  The last
+                                    # s actions of the new chunk are unguided.
+                                    rtc_end = prefix_attention_end(
+                                        int(pi05_config.chunk_size),
+                                        int(rlt_config.n_action_steps_rl),
+                                    )
+                            planner.submit(
+                                planning_obs, obs_to_state_tensor(planning_obs),
+                                # Both steps are execution-grid ticks: the
+                                # observation belongs to this tick, and the plan
+                                # is consumed at the boundary after the rest of
+                                # the window.  Adding the tick offset twice made
+                                # poll() reject every prefetch.
+                                source_step=episode_step_counter,
+                                target_step=target_step,
+                                prefix=rtc_prefix, delay=rtc_delay, horizon=rtc_end,
+                            )
+                    requested_target = requested_targets[0, action_offset].clone()
+                    physical_target = requested_target.clone()
+                    # Spend boundary feature/actor work inside the next tick's
+                    # budget. Rebase after an overrun instead of sending a burst
+                    # of overdue motor targets.
+                    if next_policy_tick is not None:
+                        time.sleep(max(0.0, next_policy_tick - time.monotonic()))
+                    if SHUTDOWN or EMERGENCY_STOP or SKIP_EPISODE or FINISH_EPISODE:
+                        break
+                    if HIL_TOGGLE_REQUESTED or teleop.takeover_request_pending:
+                        takeover.latch(teleop.consume_takeover_request())
+                        takeover_during_chunk = True
+                        if planner is not None:
+                            planner.invalidate()
+                        break
+                    next_policy_tick = time.monotonic() + target_dt
+                    actual_target = send_validated_action(physical_target, action_source)
                     if actual_target is None:
                         SHUTDOWN = True
                         break
-                    if debug_dir is not None and CRITICAL_PHASE_ACTIVE:
+                    if action_source == "ACTOR" and not actor_control_active:
+                        actor_control_active = True
+                        logger.info(
+                            "[KEY] Actor takeover STARTED: ep%d step%d",
+                            episode, episode_step_counter,
+                        )
+                        print(
+                            f"[KEY] Actor takeover STARTED (episode {episode}, step {episode_step_counter})",
+                            flush=True,
+                        )
+                    elif action_source != "ACTOR" and actor_control_active:
+                        actor_control_active = False
+                        logger.info(
+                            "[KEY] Actor takeover STOPPED: ep%d step%d",
+                            episode, episode_step_counter,
+                        )
+                        print(
+                            f"[KEY] Actor takeover STOPPED (episode {episode}, step {episode_step_counter})",
+                            flush=True,
+                        )
+                    window_sent_at.append(time.monotonic())
+                    if debug_dir is not None and window_critical_active:
                         debug_steps.append({
                             "step": episode_step_counter,
                             "source": action_source,
                             "state": obs_to_state_tensor(obs).tolist(),
-                            "target": target_deg.detach().cpu().tolist(),
+                            "target": physical_target.detach().cpu().tolist(),
                             "sent": actual_target.detach().cpu().tolist(),
                         })
                     if last_valid_target is not None:
                         mirror_follower_to_leader(last_valid_target)
-                    normalized_action = normalize_action(actual_target.to(device))
-                    window.append(normalized_action, current_source)
-                    if CRITICAL_PHASE_ACTIVE:
+                    normalized_action = normalize_action(actual_target)
+                    normalized_request = normalize_action(requested_target)
+                    window.append(
+                        normalized_action,
+                        current_source,
+                        requested_action=normalized_request,
+                    )
+                    if window_critical_active:
                         if critical_step_counter is None:
-                            # CRITICAL_PHASE_ACTIVE is toggled by the console
-                            # thread ('c') and may flip mid-chunk, so the
-                            # top-of-iteration init may not have run yet.
+                            # The window owns its collection state even when
+                            # c changes the next window's requested state.
                             critical_step_counter = 0
                         step_records.append(StepRecord(
                             action=normalized_action,
                             source=current_source,
                             intervention=False,
                             step_id=episode_step_counter,
+                            requested_action=normalized_request,
                             # Per-step VLA reference: the raw chunk covering this
                             # step, aligned to the step's offset in that chunk.
                             # This keeps stride windows that cross a re-plan
@@ -4058,21 +5423,23 @@ def main():
                             # is compared against the reference of the chunk it
                             # actually came from, not the window-start chunk).
                             ref_row=(
-                                action_cache.raw_actions[
+                                window_raw_actions[
                                     :, action_index + action_offset, :rlt_config.action_dim
                                 ].detach().squeeze(0).clone()
-                                if action_cache.raw_actions is not None
+                                if window_raw_actions is not None
                                 else None
                             ),
                         ))
                         critical_step_counter += 1
                     episode_step_counter += 1
-                    remaining_dt = target_dt - (time.time() - step_start)
-                    if remaining_dt > 0:
-                        time.sleep(remaining_dt)
-                    step_start = time.time()
                 if SHUTDOWN:
                     break
+                if planning_log is not None:
+                    planning_log.write(json.dumps({
+                        "kind": "window", "episode": episode,
+                        "step": window.boundary.step_id, "source": action_source,
+                        "sent_at": window_sent_at,
+                    }) + "\n")
                 source_counts[TransitionSource(current_source)] += window.executed_steps
                 # Receding-horizon ACTOR execution (partial windows) clears the
                 # cache so the next boundary forces a fresh plan. In the default
@@ -4093,13 +5460,14 @@ def main():
                     # partial policy window is executed but not recorded (mirrors
                     # the CRITICAL_PHASE_ACTIVE guards on human chunks and on
                     # complete autonomous windows).
-                    if window.executed_steps and CRITICAL_PHASE_ACTIVE:
+                    if window.executed_steps and window_critical_active:
                         deferred_windows.append(DeferredExecutionWindow(
                             start=window.boundary,
                             end=end_snapshot,
                             actions=list(window.actions),
                             sources=list(window.sources),
                             intervention_flags=list(window.intervention_flags),
+                            requested_actions=list(window.requested_actions),
                         ))
                     human_boundary = end_snapshot
                     continue
@@ -4109,14 +5477,16 @@ def main():
                 expected_steps = steps_to_execute
                 if window.executed_steps < expected_steps:
                     break
-                pending_policy_window = window if CRITICAL_PHASE_ACTIVE else None
+                pending_policy_window = window if window_critical_active else None
 
-                if step % 10 == 0:
+                if (step - 1) % 10 == 0:
                     logger.info(
                         "  Step %s/%s | Source: %s | Interventions so far: %s",
-                        step, max_rollout_blocks, action_source, intervention_steps,
+                        step - 1, max_rollout_blocks, action_source, intervention_steps,
                     )
             # ── End of rollout blocks ───────────────────────────────────────
+            if planner is not None:
+                planner.invalidate()
             # Reset per-episode HIL/mirror state so the leader mirror re-engages
             # (torque on, hold) during the reward prompt, replay finalization and
             # the between-episode reset. A stale unconsumed takeover request or an
@@ -4132,6 +5502,8 @@ def main():
                 # leaving the arm to hold implicitly.
                 if args.manual_positioning or not args.reset_between_episodes:
                     hold_follower_at_current_pose("episode end")
+            if planner is not None and not planner.join(args.inference_timeout_s):
+                raise TimeoutError("Background pi0.5 inference did not finish after rollout stopped")
             # Write per-step debug records (state / target / sent / source).
             if debug_dir is not None and debug_steps:
                 try:
@@ -4146,11 +5518,9 @@ def main():
             # real-time execution loop has yielded control.
             flush_deferred_hil_windows()
 
-            # Capture a terminal observation for stride-2 replay tail windows.
-            # Fallback only: the preferred terminal observation is anchored at
-            # the critical-phase-OFF moment (captured in the toggle blocks above);
-            # this catches episodes that end while the critical phase is still
-            # active (e.g. 'f' pressed mid-critical-phase).
+            # Use the manual c OFF observation if present; otherwise capture
+            # the operator's episode-end observation. Classifier probability
+            # drops never supply a training terminal.
             if terminal_snapshot is None and step_records and not SHUTDOWN and not EMERGENCY_STOP and not robot_faulted:
                 terminal_snapshot = capture_boundary_snapshot("terminal transition", episode_step_counter)
                 if terminal_snapshot is not None:
@@ -4166,10 +5536,8 @@ def main():
             # y/n (and discarded by the skip/discard paths).
             terminal_pending_window: ExecutionWindow | None = None
             if pending_policy_window is not None and not SHUTDOWN and not EMERGENCY_STOP and not robot_faulted:
-                # Prefer the terminal snapshot anchored at the critical-phase-OFF
-                # moment (captured in the toggle blocks); only capture here as a
-                # fallback when the critical phase never turned off (e.g. 'f'
-                # pressed while it is still active).
+                # Reuse the episode-end snapshot, or capture it here for a
+                # pending window without stride records.
                 if terminal_snapshot is None:
                     terminal_snapshot = capture_boundary_snapshot("terminal transition", episode_step_counter)
                     if terminal_snapshot is not None:
@@ -4185,10 +5553,15 @@ def main():
                 episode_transitions.clear()
                 break
 
+            if actor_control_active:
+                actor_control_active = False
+                logger.info("[KEY] Actor takeover STOPPED: episode %d ended", episode)
+                print("[KEY] Actor takeover STOPPED; episode ended", flush=True)
+
             # ── End of episode ──────────────────────────────────────────────
             if SKIP_EPISODE:
                 SKIP_EPISODE = False
-                logger.info("Episode skipped by user (press 'g').")
+                logger.info("Episode skipped by user (press 'g'); it is not counted and will be retried.")
                 episode_transitions.clear()
                 if not EMERGENCY_STOP and not robot_faulted and not args.manual_positioning:
                     reset_follower_to_initial_pose()
@@ -4206,6 +5579,7 @@ def main():
                 # Drain the background stride worker so nothing leaks into the next episode
                 if step_records and replay_stride > 1:
                     flush_stride_materialization()
+                score_discard = False
                 if (
                     args.inference_score
                     and not SHUTDOWN and not EMERGENCY_STOP and not robot_faulted
@@ -4224,6 +5598,8 @@ def main():
                 episode_transitions.clear()
                 if not EMERGENCY_STOP and not robot_faulted and not args.manual_positioning:
                     reset_follower_to_initial_pose()
+                if not score_discard:
+                    episode += 1
                 continue
 
             if hil_terminal_reward is None:
@@ -4234,7 +5610,10 @@ def main():
                 logger.info("User requested quit.")
                 break
             if discard_episode:
-                logger.info("Discarded episode %s with %s transitions.", episode, len(episode_transitions))
+                logger.info(
+                    "Discarded episode %s with %s transitions; it is not counted and will be retried.",
+                    episode, len(episode_transitions),
+                )
                 episode_transitions.clear()
                 if not EMERGENCY_STOP and not robot_faulted and not args.manual_positioning:
                     reset_follower_to_initial_pose()
@@ -4333,6 +5712,12 @@ def main():
             recent_interventions = episode_interventions[-20:]
             avg_interventions = sum(recent_interventions) / len(recent_interventions)
 
+            print(
+                f"[RL] critic_updates={critic_updates} | actor_updates={actor_updates}"
+                + (f" | aligned_critic_updates={aligned_critic_updates}"
+                   f" | execution_replay={buffer.stats()['execution_entries']}" if action_transform is not None else ""),
+                flush=True,
+            )
             logger.info(
                 f"  Episode {episode} | Reward: {reward} | "
                 f"Interventions: {intervention_steps} steps | "
@@ -4343,8 +5728,7 @@ def main():
                 f"rl={source_counts[TransitionSource.RL]} "
                 f"human={source_counts[TransitionSource.HUMAN]} "
                 f"mixed={source_counts[TransitionSource.MIXED]} | "
-                f"Actor clamp: {actor_clamp_steps} step(s), max Δ{actor_clamp_max_delta:.1f}° | "
-                f"Updates: {total_updates}"
+                f"Critic updates: {critic_updates} | Actor updates: {actor_updates}"
             )
             # Episode summary line in the metrics log ('#'-prefixed, tail-friendly).
             append_metrics_line(
@@ -4354,20 +5738,31 @@ def main():
                 f"sources_b={source_counts[TransitionSource.BASE]} "
                 f"rl={source_counts[TransitionSource.RL]} "
                 f"h={source_counts[TransitionSource.HUMAN]} "
-                f"m={source_counts[TransitionSource.MIXED]} | updates={total_updates}"
+                f"m={source_counts[TransitionSource.MIXED]} | updates={total_updates} "
+                f"critic_updates={critic_updates} actor_updates={actor_updates}"
             )
 
             # ── Save checkpoint ─────────────────────────────────────────────
             if episode % args.save_every == 0:
                 ckpt_path = output_dir / f"checkpoint_ep{episode}.pt"
-                save_stage2_checkpoint(ckpt_path, episode, episode_rewards, episode_interventions, total_updates)
+                save_stage2_checkpoint(ckpt_path, episode, episode_rewards, episode_interventions)
                 logger.info(f"  Saved checkpoint: {ckpt_path}")
 
             if not should_continue:
                 logger.info("User requested quit.")
                 break
+            episode += 1
 
         # ── Cleanup ─────────────────────────────────────────────────────────
+        # A graceful q can arrive while the policy loop is active.  Leave the
+        # worker's policy phase immediately so its observation lease cannot
+        # expire while the inference/training threads are being joined.
+        if hardware is not None and GRACEFUL_QUIT_REQUESTED and not EMERGENCY_STOP:
+            try:
+                hardware.set_phase("idle", refresh=True)
+            except Exception as exc:
+                logger.warning("Could not enter ARX idle phase before home return: %s", exc)
+
         # Stop the async trainer before saving checkpoints so state_dicts are stable.
         if training_thread is not None:
             training_stop.set()
@@ -4378,7 +5773,25 @@ def main():
         leader_mirror_thread.join(timeout=2.0)
 
         teleop.stop()
-        if leader_connected:
+        if (hardware is not None and GRACEFUL_QUIT_REQUESTED and not EMERGENCY_STOP
+                and not robot_faulted):
+            try:
+                print("[KEY] Returning to the ARX SDK home pose before stopping", flush=True)
+                returned_home = hardware.return_home()
+                print(
+                    "[KEY] Home pose reached; stopping" if returned_home is not None
+                    else "[KEY] Home return incomplete; stopping",
+                    flush=True,
+                )
+            except Exception as exc:
+                logger.warning("Graceful-quit home return failed; stopping in place: %s", exc)
+                print("[KEY] Home return failed; stopping in place", flush=True)
+        if hardware is not None:
+            try:
+                hardware.stop()
+            except Exception as exc:
+                logger.warning("ARX hardware stop during cleanup failed: %s", exc)
+        if leader_connected and hardware is None:
             try:
                 leader.disable_torque()
             except Exception as exc:
@@ -4412,7 +5825,6 @@ def main():
                 completed_episode,
                 episode_rewards,
                 episode_interventions,
-                total_updates,
             )
 
         with open(output_dir / "training_log.json", "w") as f:
@@ -4420,22 +5832,29 @@ def main():
                 "episode_rewards": episode_rewards,
                 "episode_interventions": episode_interventions,
                 "total_updates": total_updates,
+                "critic_updates": critic_updates,
+                "actor_updates": actor_updates,
+                "aligned_critic_updates": aligned_critic_updates,
             }, f, indent=2)
 
         total_episodes = len(episode_rewards)
         total_interventions = sum(episode_interventions)
         logger.info(f"\nTraining complete!")
         logger.info(f"  Episodes: {total_episodes}")
-        logger.info(f"  Total updates: {total_updates}")
+        logger.info(f"  Critic updates: {critic_updates}")
+        logger.info(f"  Actor updates: {actor_updates}")
         logger.info(f"  Total intervention steps: {total_interventions}")
         logger.info(f"  Final success rate (last 20): "
                     f"{sum(episode_rewards[-20:]) / max(1, len(episode_rewards[-20:])):.0%}")
         logger.info(f"  Checkpoints: {output_dir}")
-        print(f"\nTraining complete! Episodes: {total_episodes} | Updates: {total_updates} | "
+        print(f"\nTraining complete! Episodes: {total_episodes} | "
+              f"Critic updates: {critic_updates} | Actor updates: {actor_updates} | "
               f"Success (last 20): "
               f"{sum(episode_rewards[-20:]) / max(1, len(episode_rewards[-20:])):.0%}",
               flush=True)
     finally:
+        if planner is not None:
+            planner.invalidate()
         if visualization is not None:
             try:
                 visualization.stop()
@@ -4465,7 +5884,12 @@ def main():
                 except Exception as exc:
                     logger.warning("Leader mirror cleanup failed: %s", exc)
         console.stop()
-        if leader_connected and leader is not None:
+        if hardware is not None:
+            try:
+                hardware.close()
+            except Exception as exc:
+                logger.warning("ARX final stop/cleanup failed: %s", exc)
+        if leader_connected and leader is not None and hardware is None:
             try:
                 leader.disable_torque()
             except Exception as exc:
@@ -4474,7 +5898,7 @@ def main():
                 leader.disconnect()
             except Exception as exc:
                 logger.warning("Leader final disconnect failed: %s", exc)
-        if follower_connected and follower is not None:
+        if follower_connected and follower is not None and hardware is None:
             try:
                 follower.disconnect()
             except Exception as exc:
@@ -4482,6 +5906,10 @@ def main():
         if critical_recorder is not None:
             critical_recorder.close()
             logger.info("Critical-phase recorder closed: %s", critical_recorder.path)
+        if planner is not None and not planner.join(args.inference_timeout_s):
+            logger.error("Background pi0.5 inference is still shutting down; its targets were invalidated")
+        if planning_log is not None:
+            planning_log.close()
 
 
 if __name__ == "__main__":

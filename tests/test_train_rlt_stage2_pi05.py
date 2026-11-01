@@ -23,6 +23,143 @@ def _load_stage2_module():
 
 
 class Pi05ActionScaleTest(unittest.TestCase):
+    def test_start_blend_uses_physical_pose_and_preserves_gripper(self):
+        module = _load_stage2_module()
+        targets = torch.tensor([[[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
+                                 [11.0, 21.0, 31.0, 41.0, 51.0, 61.0, 71.0],
+                                 [12.0, 22.0, 32.0, 42.0, 52.0, 62.0, 72.0]]])
+        measured = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+        result = module.blend_start_targets(targets, measured, 2, joint_count=6)
+
+        torch.testing.assert_close(
+            result,
+            torch.tensor([[[5.0, 10.5, 16.0, 21.5, 27.0, 32.5, 70.0],
+                           [11.0, 21.0, 31.0, 41.0, 51.0, 61.0, 71.0],
+                           [12.0, 22.0, 32.0, 42.0, 52.0, 62.0, 72.0]]]),
+        )
+
+    def test_dense_grid_tick_conversion_uses_explicit_axes(self):
+        module = _load_stage2_module()
+
+        self.assertEqual(
+            module.resampled_chunk_length(10, source_hz=30.0, target_hz=100.0),
+            31,
+        )
+        self.assertEqual(
+            module.model_action_index_for_tick(5, tick_hz=100.0, action_hz=30.0),
+            2,
+        )
+        self.assertEqual(
+            module.model_action_count_for_ticks(5, tick_hz=30.0, action_hz=30.0),
+            5,
+        )
+        self.assertEqual(
+            module.model_action_count_for_ticks(5, tick_hz=100.0, action_hz=30.0),
+            2,
+        )
+
+    def test_rtc_prefix_uses_current_command_action_not_the_next(self):
+        module = _load_stage2_module()
+
+        # pi0.5's PreparedChunk.model_index_for_command:
+        # ceil((k+1) * action_hz / control_hz) - 1.
+        self.assertEqual(
+            module.model_action_index_for_command(5, command_hz=100.0, action_hz=30.0),
+            1,
+        )
+        self.assertEqual(
+            module.model_action_index_for_command(25, command_hz=100.0, action_hz=30.0),
+            7,
+        )
+        self.assertEqual(
+            module.model_action_index_for_command(30, command_hz=100.0, action_hz=30.0),
+            9,
+        )
+        # The plan-age mapper deliberately rounds; the RTC prefix must not.
+        self.assertEqual(
+            module.model_action_index_for_tick(25, tick_hz=100.0, action_hz=30.0),
+            8,
+        )
+
+    def test_prefix_attention_end_matches_official_rtc(self):
+        module = _load_stage2_module()
+
+        # Official RTC: guided prefix ends at H - s, where s is the execution
+        # horizon (10 model actions), not the inference delay.
+        self.assertEqual(module.prefix_attention_end(50, 10), 40)
+        self.assertEqual(module.prefix_attention_end(50, 50), 1)
+
+    def test_deploy_rtc_prefix_is_truncated_to_guided_end(self):
+        from lerobot.rollout.inference.rtc import (
+            _normalize_prev_actions_length,
+            _prefix_attention_end,
+        )
+
+        self.assertEqual(_prefix_attention_end(50, 10), 40)
+        normalized = _normalize_prev_actions_length(torch.zeros(43, 7), 40)
+        self.assertEqual(tuple(normalized.shape), (40, 7))
+        padded = _normalize_prev_actions_length(torch.zeros(38, 7), 40)
+        self.assertEqual(tuple(padded.shape), (40, 7))
+
+    def test_full_chunk_command_slice_matches_pi05(self):
+        module = _load_stage2_module()
+
+        # pi0.5 resamples the full 50-action chunk, then slices the 31-point
+        # execution window starting at the plan age (2 actions -> command 7).
+        self.assertEqual(
+            module.resampled_chunk_length(50, source_hz=30.0, target_hz=100.0),
+            164,
+        )
+        self.assertEqual(
+            module.resampled_chunk_length(10, source_hz=30.0, target_hz=100.0),
+            31,
+        )
+        self.assertEqual(
+            module.command_index_for_model_step(2, command_hz=100.0, action_hz=30.0),
+            7,
+        )
+        self.assertEqual(
+            module.command_index_for_model_step(4, command_hz=100.0, action_hz=30.0),
+            14,
+        )
+
+    def test_async_plan_is_consumed_only_at_its_target_boundary(self):
+        module = _load_stage2_module()
+        calls = []
+
+        def predict(observation, state, prefix, delay, horizon):
+            calls.append((observation, state, prefix, delay, horizon))
+            return torch.zeros(1, 12, 7), torch.ones(1, 4)
+
+        planner = module.AsyncPi05Planner(predict)
+        prefix = torch.zeros(1, 5, 7)
+        self.assertTrue(
+            planner.submit(
+                {"frame": torch.zeros(2, 2, 3)},
+                torch.zeros(7),
+                source_step=4,
+                target_step=10,
+                prefix=prefix,
+                delay=2,
+                horizon=12,
+            )
+        )
+        self.assertIsNone(planner.poll(9))
+        deadline = time.monotonic() + 1.0
+        ready = None
+        while ready is None and time.monotonic() < deadline:
+            ready = planner.poll(10)
+            if ready is None:
+                time.sleep(0.001)
+        self.assertIsNotNone(ready)
+        self.assertEqual(ready.source_step, 4)
+        self.assertEqual(ready.target_step, 10)
+        self.assertEqual(ready.rtc_prefix_steps, 5)
+        self.assertEqual(ready.rtc_delay, 2)
+        self.assertEqual(len(calls), 1)
+        planner.join()
+
     def test_subsampled_pi05_actions_stay_in_model_normalized_space(self):
         module = _load_stage2_module()
         actions = torch.tensor([[[0.25, -0.75], [0.50, -0.50], [0.75, -0.25]]])

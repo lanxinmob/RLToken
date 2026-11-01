@@ -40,6 +40,7 @@ SO101_JOINT_NAMES = (
     "wrist_roll",
     "gripper",
 )
+ARX_JOINT_NAMES = tuple(f"joint_{index}" for index in range(1, 7)) + ("gripper",)
 
 
 def _canonical_joint_name(name: str) -> str:
@@ -61,15 +62,15 @@ def action_order_indices(source_names, target_names) -> tuple[int, ...]:
     """
     source = tuple(_canonical_joint_name(name) for name in source_names)
     target = tuple(_canonical_joint_name(name) for name in target_names)
-    allowed = set(SO101_JOINT_NAMES)
+    allowed_orders = (set(SO101_JOINT_NAMES), set(ARX_JOINT_NAMES))
     if len(source) != len(target):
         raise ValueError(f"Action order length mismatch: source={len(source)} target={len(target)}")
     if len(set(source)) != len(source) or len(set(target)) != len(target):
         raise ValueError(f"Action order contains duplicate joints: source={source}, target={target}")
-    if set(source) != allowed:
-        raise ValueError(f"Policy action order must contain SO-101 joints {SO101_JOINT_NAMES}, got {source}")
-    if set(target) != allowed:
-        raise ValueError(f"Robot action order must contain SO-101 joints {SO101_JOINT_NAMES}, got {target}")
+    if set(source) not in allowed_orders:
+        raise ValueError(f"Unsupported policy joint names: {source}")
+    if set(target) != set(source):
+        raise ValueError(f"Robot and policy joints differ: {source}, {target}")
     positions = {name: index for index, name in enumerate(source)}
     return tuple(positions[name] for name in target)
 
@@ -214,6 +215,9 @@ class Transition:
     intervention_flag: bool = False
     episode_id: int = 0
     step_id: int = 0
+    requested_chunk: np.ndarray | None = None  # pre-SDK requested targets, normalized
+    execution_state: np.ndarray | None = None  # physical (previous, filtered) targets
+    next_execution_state: np.ndarray | None = None
 
     def to_numpy(self) -> dict[str, np.ndarray]:
         return {
@@ -221,6 +225,10 @@ class Transition:
             "proprio": _ensure_array(self.proprio, dtype=np.float32),
             "ref_chunk": _ensure_array(self.ref_chunk, dtype=np.float16),
             "action_chunk": _ensure_array(self.action_chunk, dtype=np.float16),
+            "requested_chunk": _ensure_array(
+                self.action_chunk if self.requested_chunk is None else self.requested_chunk,
+                dtype=np.float16,
+            ),
             "rewards": _ensure_array(self.rewards, dtype=np.float32),
             "done": _ensure_array(self.done, dtype=np.bool_),
             "next_z_rl": _ensure_array(self.next_z_rl, dtype=np.float16),
@@ -237,6 +245,16 @@ class Transition:
             "intervention_flag": _ensure_array(self.intervention_flag, dtype=np.bool_),
             "episode_id": _ensure_array(self.episode_id, dtype=np.int32),
             "step_id": _ensure_array(self.step_id, dtype=np.int32),
+            "execution_state": _ensure_array(
+                np.zeros((2, self.action_chunk.shape[-1])) if self.execution_state is None else self.execution_state,
+                dtype=np.float32,
+            ),
+            "next_execution_state": _ensure_array(
+                np.zeros((2, self.action_chunk.shape[-1])) if self.next_execution_state is None else self.next_execution_state,
+                dtype=np.float32,
+            ),
+            "execution_valid": _ensure_array(self.execution_state is not None, dtype=np.bool_),
+            "next_execution_valid": _ensure_array(self.next_execution_state is not None, dtype=np.bool_),
         }
 
 
@@ -301,6 +319,10 @@ class BoundaryContext:
     collection_phase: str
     episode_id: int
     step_id: int
+    execution_state: np.ndarray | None = None
+    # Physical follower state at this boundary (ARX rad/m). ``proprio`` is
+    # quantile-normalized and must never be mixed with plan targets.
+    measured_state: torch.Tensor | None = None
 
 
 @dataclass
@@ -309,13 +331,24 @@ class ExecutionWindow:
 
     boundary: BoundaryContext
     actions: list[torch.Tensor] = field(default_factory=list)
+    requested_actions: list[torch.Tensor | None] = field(default_factory=list)
     sources: list[int] = field(default_factory=list)
     intervention_flags: list[bool] = field(default_factory=list)
 
-    def append(self, actual_action: torch.Tensor, source: int, intervention: bool = False) -> None:
+    def append(
+        self,
+        actual_action: torch.Tensor,
+        source: int,
+        intervention: bool = False,
+        *,
+        requested_action: torch.Tensor | None = None,
+    ) -> None:
         if actual_action.ndim != 1:
             raise ValueError(f"Executed action must be rank 1, got {tuple(actual_action.shape)}")
         self.actions.append(actual_action.detach().clone())
+        self.requested_actions.append(
+            None if requested_action is None else requested_action.detach().clone()
+        )
         self.sources.append(int(source))
         self.intervention_flags.append(bool(intervention))
 
@@ -352,15 +385,15 @@ def _load_json(path: Path) -> dict:
     return value
 
 
-def _validate_quantiles(stats: dict) -> dict[str, list[float]]:
+def _validate_quantiles(stats: dict, dimension: int = 6) -> dict[str, list[float]]:
     result = {}
     for key in ("observation.state", "action"):
         if key not in stats or not isinstance(stats[key], dict):
             raise ValueError(f"Normalization stats missing {key!r}")
         q01 = np.asarray(stats[key].get("q01"), dtype=np.float32)
         q99 = np.asarray(stats[key].get("q99"), dtype=np.float32)
-        if q01.shape != (6,) or q99.shape != (6,):
-            raise ValueError(f"{key} quantiles must each be exactly 6D")
+        if q01.shape != (dimension,) or q99.shape != (dimension,):
+            raise ValueError(f"{key} quantiles must each be exactly {dimension}D")
         if not np.isfinite(q01).all() or not np.isfinite(q99).all():
             raise ValueError(f"{key} quantiles must be finite")
         if not np.all(q99 > q01):
@@ -370,14 +403,20 @@ def _validate_quantiles(stats: dict) -> dict[str, list[float]]:
 
 
 def load_normalization_stats(pi05_path: Path, explicit_stats_path: str | None) -> tuple[dict, str]:
+    config = _load_json(pi05_path / "config.json")
+    dimension = config["output_features"]["action"]["shape"][0]
+    if dimension not in (6, 7) or config["input_features"]["observation.state"]["shape"] != [dimension]:
+        raise ValueError("Expected matching SO-101 6D or ARX 7D state/action features")
+    if config.get("use_relative_actions", False):
+        raise ValueError("Stage 2 requires absolute actions")
     if explicit_stats_path:
         path = Path(explicit_stats_path).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"Explicit stats path does not exist: {path}")
         raw = _load_json(path)
         if raw.get("use_relative_actions") is True:
-            raise ValueError("Stage 2 requires absolute 6D actions; use_relative_actions must be false")
-        return _validate_quantiles(raw), str(path.resolve())
+            raise ValueError("Stage 2 requires absolute actions; use_relative_actions must be false")
+        return _validate_quantiles(raw, dimension), str(path.resolve())
 
     processor_path = pi05_path / "policy_preprocessor.json"
     if not processor_path.is_file():
@@ -417,7 +456,7 @@ def load_normalization_stats(pi05_path: Path, explicit_stats_path: str | None) -
             if q01 is not None and q99 is not None:
                 extracted[feature] = {"q01": q01.cpu().tolist(), "q99": q99.cpu().tolist()}
                 break
-    return _validate_quantiles(extracted), ",".join(str(p.resolve()) for p in candidates)
+    return _validate_quantiles(extracted, dimension), ",".join(str(p.resolve()) for p in candidates)
 
 
 def parse_camera_map(

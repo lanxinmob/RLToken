@@ -1,0 +1,7 @@
+-e lerobot[training,pi,hardware]
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchcodec==0.3.0
+h5py==3.14.0
+pyzmq==27.1.0
+sentencepiece==0.2.1

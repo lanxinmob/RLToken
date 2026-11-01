@@ -33,8 +33,10 @@ import hashlib
 import json
 import logging
 import math
+import os
 import random
 import signal
+import select
 import sys
 import traceback
 import threading
@@ -70,6 +72,10 @@ POSITIONING_STATE = "off"  # Main-thread broadcast for console feedback: "off" |
 class ConsoleInputManager:
     """Own stdin in one thread so safety controls and reward prompts cannot race.
 
+    An interactive terminal is put into single-key mode, so command keys take
+    effect immediately without pressing Enter. Non-terminal streams keep the
+    line-oriented path for pipes, tests and scripted input.
+
     With --auto_critical enabled, 'a' must not require a prior 'c' press:
     CRITICAL_PHASE_ACTIVE mirrors the detector state and flips between True and
     False (and with --auto_critical_once, which by default fires once per
@@ -91,12 +97,15 @@ class ConsoleInputManager:
         self._running = False
         self._thread: threading.Thread | None = None
         self._last_toggle_time = 0.0
+        self._terminal_fd: int | None = None
+        self._terminal_state = None
         # Whether auto critical detection is on; decides if 'a' still requires a prior 'c'
         self._auto_critical = bool(auto_critical)
 
     def start(self) -> None:
         if self._running:
             return
+        self._enable_single_key_mode()
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -107,18 +116,63 @@ class ConsoleInputManager:
             self._condition.notify_all()
         if self._thread:
             self._thread.join(timeout=0.2)
+        self._restore_terminal()
+
+    def _enable_single_key_mode(self) -> None:
+        """Use cbreak input only for a real interactive terminal."""
+        try:
+            if not self._stream.isatty():
+                return
+            fd = self._stream.fileno()
+            if not os.isatty(fd):
+                return
+            import termios
+            import tty
+            self._terminal_fd = fd
+            self._terminal_state = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except (AttributeError, ImportError, OSError):
+            self._terminal_fd = None
+            self._terminal_state = None
+
+    def _restore_terminal(self) -> None:
+        if self._terminal_fd is None or self._terminal_state is None:
+            return
+        try:
+            import termios
+            termios.tcsetattr(self._terminal_fd, termios.TCSADRAIN, self._terminal_state)
+        except (ImportError, OSError):
+            pass
+        finally:
+            self._terminal_fd = None
+            self._terminal_state = None
+
+    def _read_value(self) -> str | None:
+        if self._terminal_fd is not None:
+            ready, _, _ = select.select([self._terminal_fd], [], [], 0.1)
+            if not ready:
+                return None
+            data = os.read(self._terminal_fd, 1)
+            if not data:
+                return ""
+            return data.decode(errors="ignore").lower()
+        line = self._stream.readline()
+        if not line:
+            time.sleep(0.05)
+            return None
+        return line.strip().lower()
 
     def _loop(self) -> None:
         global EMERGENCY_STOP, SHUTDOWN, ACTOR_ENABLED, SKIP_EPISODE, FINISH_EPISODE, CRITICAL_PHASE_ACTIVE, HIL_FORCE_RESUME, HIL_TOGGLE_REQUESTED, CRITICAL_MANUAL_OVERRIDE_AT, POSITION_TOGGLE_REQUESTED
         while self._running and not SHUTDOWN:
             try:
-                line = self._stream.readline()
+                value = self._read_value()
             except Exception:
                 return
-            if not line:
-                time.sleep(0.05)
+            if value is None:
                 continue
-            value = line.strip().lower()
+            if not value or value in ("\r", "\n"):
+                continue
             if value.startswith("e"):
                 EMERGENCY_STOP = True
                 logger.warning("[KEY] EMERGENCY STOP requested (press 'e')")
@@ -1268,6 +1322,11 @@ def main():
     global SHUTDOWN, EMERGENCY_STOP, SKIP_EPISODE, FINISH_EPISODE, CRITICAL_PHASE_ACTIVE, HIL_FORCE_RESUME, HIL_TOGGLE_REQUESTED
     global POSITION_TOGGLE_REQUESTED, POSITIONING_STATE
     args = parse_args()
+    if args.actor_max_relative_target is not None:
+        raise ValueError(
+            "--actor_max_relative_target is disabled: actor-only clipping is not part of the "
+            "trained execution contract"
+        )
     # ── Deployment script: inference only ────────────────────────────────
     # This script never learns: no replay, no updates, no training checkpoints.
     # Episodes restart at 1, and dataset recording uses episode_index from 0.
@@ -1355,8 +1414,7 @@ def main():
     logger.info("Safety / HIL:")
     logger.info("  dry_run         = %s | max_relative_target = %s",
                 args.dry_run, args.max_relative_target if args.max_relative_target else "disabled")
-    logger.info("  actor_max_relative_target = %s (ACTOR-only per-step clamp)",
-                args.actor_max_relative_target if args.actor_max_relative_target else "disabled")
+    logger.info("  actor_max_relative_target = disabled (rejected if configured; use the ARX execution contract)")
     logger.info("  actor_noise_std = %s | actor_execute_mean = %s | control_fps = %s",
                 args.actor_noise_std, args.actor_execute_mean, args.control_fps)
     logger.info("  leader_mirror = %s (False = leader does not move) | leader_mirror_torque_limit = %s | intervention_threshold = %s",
@@ -1642,7 +1700,6 @@ def main():
             args.camera_map, checkpoint_image_features, set(cameras_dict), pad_missing=args.pad_missing_cameras,
         )
         max_relative_target = parse_max_relative_target(args.max_relative_target)
-        actor_relative_limit = parse_max_relative_target(args.actor_max_relative_target)
     except ValueError as exc:
         logger.error("Startup preflight failed: %s", exc)
         return
@@ -1999,6 +2056,8 @@ def main():
             # torch.from_numpy() doesn't choke on bare Python floats.
             raw_obs = {}
             for k, v in obs.items():
+                if k == "_rlt_execution_state":
+                    continue
                 if k in camera_feature_map:
                     raw_obs[camera_feature_map[k]] = v
                 elif isinstance(v, (int, float)):
@@ -2371,9 +2430,6 @@ def main():
             # ── Execution state ────────────────────────────────────────────
             action_cache = Pi05ActionCache()
             takeover = TakeoverState()
-
-            # Actor per-step clamp accounting (reported in the episode summary).
-            actor_clamp_max_delta = 0.0
 
             # Per-step counters (critical-phase gating + debug logging).
             episode_step_counter = 0
@@ -2866,26 +2922,6 @@ def main():
                     if CRITICAL_PHASE_ACTIVE and critical_step_counter is None:
                         critical_step_counter = 0
                     target_deg = unnormalize_action(requested_actions[0, action_offset])
-                    # ACTOR-only per-step angle limit, relative to the last
-                    # commanded pose. VLA / HUMAN / RESET are never clamped here
-                    # (the driver-level max_relative_target is the only all-source
-                    # clamp, and it is normally disabled).
-                    if action_source == "ACTOR" and actor_relative_limit is not None and last_valid_target is not None:
-                        ref = action_dict_to_tensor(last_valid_target, "actor clamp reference").to(target_deg.device)
-                        clamped = target_deg.clone()
-                        for _joint_idx, _joint_name in enumerate(JOINT_NAMES):
-                            _lim = actor_relative_limit.get(_joint_name)
-                            if _lim is None:
-                                continue
-                            _lo = ref[_joint_idx] - _lim
-                            _hi = ref[_joint_idx] + _lim
-                            clamped[_joint_idx] = torch.clamp(target_deg[_joint_idx], _lo, _hi)
-                        if not torch.equal(clamped, target_deg):
-                            _clamp_delta = float((clamped - target_deg).abs().max())
-                            actor_clamp_max_delta = max(actor_clamp_max_delta, _clamp_delta)
-                            logger.debug("Actor action clamped by per-step limit (max delta %.1f deg).",
-                                         _clamp_delta)
-                        target_deg = clamped
                     actual_target = send_validated_action(target_deg, action_source)
                     if actual_target is None:
                         SHUTDOWN = True

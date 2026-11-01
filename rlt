@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+export HF_HUB_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=2
+export NO_PROXY="127.0.0.1,localhost,::1"
+export PYTHONPATH="$PWD:$PWD/lerobot/src"
+[[ -x .venv/bin/python ]] || { echo "Run bash setup_arx.sh first" >&2; exit 1; }
+exec .venv/bin/python rlt.py "$@"

@@ -35,8 +35,7 @@ python scripts/infer_rlt_stage2_pi05.py --config configs/infer_pi05.json
   在文件里写 `true` 或加命令行 flag 均可;**没有** `--auto_critical false` 这种写法,所以
   `"dry_run": false` 只是把默认值又写了一遍。成对开关(`record_dataset`、`rtc_enabled`、
   `leader_mirror`)在文件里可写 `true`/`false`,命令行可用 `--no-...` 关闭。
-- 有四个键存放的是 JSON 文本而不是普通值:`cameras`、`camera_map`、`max_relative_target`、
-  `actor_max_relative_target`。
+- 有三个键存放的是 JSON 文本而不是普通值:`cameras`、`camera_map`、`max_relative_target`。
 
 只有 `pi05_path` 与 `rlt_checkpoint` 是必填;其余都有可用默认值,与默认相同的键可以直接删掉,
 不影响运行。
@@ -100,7 +99,7 @@ python scripts/infer_rlt_stage2_pi05.py --config configs/infer_pi05.json
 | `actor_execution_scale` | `1.0` | actor 动作执行前的缩放系数,`0.5` 相当于半速,同一任务会占用更多控制步。 |
 | `actor_execute_mean` | 关 | 执行 actor 的均值动作而不采样,消除采样抖动。 |
 | `actor_noise_std` | `0.0` | 在上述均值上叠加的探索噪声,归一化动作空间。 |
-| `actor_max_relative_target` | 无 | 只对 actor 动作生效的单步单关节角度上限(度),相对上一次下发位姿;VLA 与人工动作不受限。 |
+| `actor_max_relative_target` | 已禁用 | 拒绝 Actor-only 相对限幅。ARX Stage 2 对所有策略目标统一使用 EMA、速度与工作空间执行契约。 |
 | `actor_critical_delay_steps` | `15` | 关键阶段持续多少控制步之后 actor 才允许接管。 |
 | `rtc_enabled` | 开 | π0.5 实时分块:用上一段动作引导新一段,消除重新规划之间的停顿。 |
 | `rtc_execution_horizon` | `10` | 两次 π0.5 规划之间执行的动作数,必须与 RL 视野和 `n_action_steps_rl` 一致。 |

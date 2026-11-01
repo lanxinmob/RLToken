@@ -307,7 +307,9 @@ class RLTTwinCritic(nn.Module):
     """Twin critic for full chunk actions: (z_rl, proprio, action_chunk) -> Q1, Q2.
 
     Same lightweight MLP family as the actor (paper-aligned, keys ``q1.*`` /
-    ``q2.*`` matching the RL-Token-Pi05 Stage-2 trained checkpoints).
+    ``q2.*`` matching the RL-Token-Pi05 Stage-2 trained checkpoints).  The
+    optional ``proprio_dim`` lets hardware-aware training append the physical
+    execution anchor without changing the legacy critic contract.
     """
 
     def __init__(
@@ -315,6 +317,7 @@ class RLTTwinCritic(nn.Module):
         config: PI05RLTConfig,
         hidden_dim: int | None = None,
         num_layers: int | None = None,
+        proprio_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -326,19 +329,23 @@ class RLTTwinCritic(nn.Module):
         self.num_layers = int(
             num_layers if num_layers is not None else getattr(config, "critic_num_layers", 2)
         )
+        self.proprio_dim = int(
+            proprio_dim if proprio_dim is not None else getattr(config, "state_dim", 6)
+        )
         if self.hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
         if self.num_layers < 1:
             raise ValueError(f"num_layers must be at least 1, got {self.num_layers}")
+        if self.proprio_dim <= 0:
+            raise ValueError(f"proprio_dim must be positive, got {self.proprio_dim}")
 
         z_dim = int(getattr(config, "rlt_hidden_dim", 256))
-        state_dim = int(getattr(config, "state_dim", 6))
         action_dim = int(getattr(config, "action_dim", 6))
         chunk = int(getattr(config, "n_action_steps_rl", 10))
 
         self.action_dim = action_dim
         self.chunk = chunk
-        input_dim = z_dim + state_dim + chunk * action_dim
+        input_dim = z_dim + self.proprio_dim + chunk * action_dim
         self.q1 = _build_mlp(input_dim, self.hidden_dim, self.num_layers, 1)
         self.q2 = _build_mlp(input_dim, self.hidden_dim, self.num_layers, 1)
 
@@ -380,6 +387,10 @@ class RLTTwinCritic(nn.Module):
             z_rl = z_rl.unsqueeze(0)
         if proprio.ndim == 1:
             proprio = proprio.unsqueeze(0)
+        if proprio.shape[-1] != self.proprio_dim:
+            raise ValueError(
+                f"proprio last dim {proprio.shape[-1]} != expected {self.proprio_dim}"
+            )
         action_flat = self._flatten_chunk(action_chunk, z_rl.shape[0])
         x = torch.cat([z_rl, proprio, action_flat], dim=-1)
         return self.q1(x), self.q2(x)

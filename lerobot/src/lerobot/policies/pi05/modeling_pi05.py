@@ -340,6 +340,9 @@ class PaliGemmaWithExpertModel(
         self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
         self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+        # PI05 consumes hidden states; vocabulary output heads are never used.
+        self.paligemma.lm_head = nn.Identity()
+        self.gemma_expert.lm_head = nn.Identity()
 
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
@@ -918,7 +921,8 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        if not next(self.model.parameters()).is_meta:
+            self.model.to(config.device)
 
         self.reset()
 
@@ -963,7 +967,10 @@ class PI05Policy(PreTrainedPolicy):
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
+        from accelerate import init_empty_weights
+
+        with init_empty_weights(include_buffers=False):
+            model = cls(config, **kwargs)
 
         # Load state dict (expects keys with "model." prefix)
         try:
@@ -987,9 +994,7 @@ class PI05Policy(PreTrainedPolicy):
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+                raise RuntimeError(f"Could not load pretrained weights: {pretrained_name_or_path}") from e
 
             # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1012,7 +1017,11 @@ class PI05Policy(PreTrainedPolicy):
             remapped_state_dict = model._prepare_pretrained_state_dict(remapped_state_dict)
 
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict, assign=True)
+            if any(parameter.is_meta for parameter in model.parameters()):
+                raise ValueError("Pretrained checkpoint left uninitialized parameters")
+            model.model.to(config.device)
+            model.model.paligemma_with_expert._set_requires_grad()
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1038,11 +1047,21 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not load state dict: {e}")
+            raise RuntimeError(f"Could not load pretrained model: {pretrained_name_or_path}") from e
 
         return model
 
     def _prepare_pretrained_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        # Training checkpoints can retain vocabulary heads. PI05 only consumes
+        # hidden states, so the local memory-saving model replaces those heads
+        # with Identity. Keep strict loading for every parameter used at runtime.
+        for name in ("paligemma", "gemma_expert"):
+            backbone = getattr(self.model.paligemma_with_expert, name)
+            if isinstance(backbone.lm_head, nn.Identity):
+                key = f"model.paligemma_with_expert.{name}.lm_head.weight"
+                if key in state_dict:
+                    del state_dict[key]
+                    logging.info("Ignoring unused vocabulary head: %s", key)
         # MEM's continuous proprioceptive projection is new relative to
         # lerobot/pi05_base. Preserve its fresh initialization on first load,
         # while loading learned values from subsequent MEM checkpoints.
