@@ -511,8 +511,35 @@ class Runtime:
                 handle.close()
 
 
+def fresh_output_dir(path: Path) -> Path:
+    """Return a fresh output directory for a stage-2 run.
+
+    The training entry fails closed on non-empty output dirs (resume is not
+    supported by writing into an old run).  Reusing a shell variable such as
+    ``$OUT_TRAIN`` should not fail the launch, so an existing non-empty path
+    gets a timestamp suffix instead of being reused.
+    """
+    path = Path(path)
+    if not path.exists():
+        return path
+    if path.is_dir() and not any(path.iterdir()):
+        return path
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    candidate = path.with_name(f"{path.name}_{stamp}")
+    index = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}_{stamp}_{index}")
+        index += 1
+    print(
+        f"Output directory {path} already exists/non-empty; using fresh directory {candidate}",
+        flush=True,
+    )
+    return candidate
+
+
 def run(args):
     """Translate the small local CLI into the pinned upstream Stage 2 entry."""
+    args.output = fresh_output_dir(Path(args.output))
     checkpoint = args.checkpoint.resolve()
     if (checkpoint / "pretrained_model").is_dir():
         checkpoint /= "pretrained_model"
