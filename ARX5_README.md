@@ -74,42 +74,48 @@ smooth_steps=4、min_on_chunks=0）；需要换路径时使用 `--critical-class
 Actor/Critic 仍使用自己的分位数归一化。默认前 60 个控制步不自动检测，
 每个动作窗口用同一份观测的 token 和实测状态检测一次，每回合重置检测历史。
 训练时分类器只触发关键阶段进入，之后不因概率下降退出。`c` 可手动截断片段，
-在当前 10 步动作窗口结束时停止采集并锚定终点；自动检测不会把手动关闭的片段重新打开。
+在当前动作窗口结束时停止采集并锚定终点（默认 31 次下发）；自动检测不会把手动关闭的片段重新打开。
 `c` 只关闭关键阶段，不直接结束回合；随后由 VLA 执行，`f` 结束并评价。
 这些在线门控及推理停顿不包含在上述离线回放指标中。
 省略 `--auto-critical` 则保留原来的手动 `c` 标记方式。
 
 历史双臂验收时从臂为 `X5_umi/can1`、主臂为 `X5/can0`；当前本机只有执行臂
 `X5_umi/can0`，默认配置改为显式单臂 HIL。夹爪全开读数为 `-3.45369`，重力倍率为
-`1.0`。默认关节安全限速为 `3.6 rad/s`（每个 30 Hz 目标最多变化 `0.12 rad`）、夹爪为 `0.01 m/s`。
-硬件进程以 100 Hz 检查反馈，策略目标以 30 Hz 直发；SDK 按其 2 ms 控制周期插值。
+`1.0`。默认关节安全限速为 `1.0 rad/s`（每个 30 Hz 目标最多变化约 `0.0333 rad`）、夹爪为 `0.01 m/s`。
+硬件进程以 100 Hz 检查反馈；模型动作先重采样到 100 Hz 网格，再以 30 Hz 下发；SDK 按其 2 ms 控制周期插值。
 自主目标不再经过额外 EMA，连续性由 RTC (`guided`, execution horizon=10) 处理。单臂人工接管时切换同一只执行臂为低刚度拖动，直接读取
 实测状态，不再向同一 CAN 总线回发人工目标；恢复策略后从新的实测边界观测重新规划。
 Actor-only 的相对目标限幅已禁用；VLA 与 Actor 都使用同一份执行契约，按执行边界的
 关节/夹爪速度和 SDK 工作空间限幅后再写入 replay。跟踪误差阈值只用于故障检测，不参与目标整形。不要在配置中设置
 `actor_max_relative_target`，否则启动会拒绝该配置。
-Stage 2 按论文保留每窗口 10 个连续动作、replay 步距 2：整段关键阶段先采集，再切成重叠窗口训练，
-每条样本的动作形状为 `10×7`。VLA 每次仍预测 50 步，每个窗口使用新计划的前 10 步。
-`../pi05` 的纯 VLA 参数 `--replan-steps 25` 不用于这个训练窗口。
+在线训练与 `--vla-only` 共用同一套执行处理。Actor 和 reference 仍为 `10×7` 个模型动作，
+VLA 每次预测 50 步；保留完整计划的左右上下文做 5 点 FIR，再按 100 Hz 网格重采样，
+默认得到 `31×7` 个目标，以 30 Hz 下发，约 1.033 秒后重规划。Actor 只替换其中的 10 个模型动作，
+使用同样的平滑、网格相位、启动混合和硬件执行变换。回合开始的前 3 次下发从实测关节姿态混合。
+`hardware_config.control_hz` 是反馈检查频率；`exec_grid_hz` 是重采样网格，二者职责不同。
 
-当前 `rlt_stage2.json` 使用 `rtc_enabled=true`、`rtc_mode=guided`、`rtc_execution_horizon=10`、
-`async_inference=false`、`replan_every_window=true`，
-动作推理在窗口边界同步完成：执行满 10 步后采集一份图像与实测状态，用这份观测生成
-VLA 参考、`z_rl` 和 Actor 动作，再执行下一窗口的 10 步。推理期间硬件维持最后接受的目标，
-不会继续提交旧动作块的后续目标；等待不增加策略步数或 replay 动作。人工接管结束后从新观测重算。
+默认使用 `async_inference=true`、RTC `guided`、`rtc_execution_horizon=10`、
+`replan_every_window=true`。根据推理耗时提前预取，窗口边界切换计划并跳过已过时的头部；
+RTC 前缀及延迟按模型动作轴换算。Actor 使用预取的图像 token/reference 和当前边界的实测状态。
+若预取未完成则保持最后接受目标，等待不进入 replay；人工接管结束后从新观测重规划。
+可用 `--no-async-inference` 切回同步规划，其他执行和训练变换仍相同。
+
+replay 的动作、来源、奖励和 `valid_mask` 均为 31 个实际控制步，重叠采样步距仍为 2 个控制步；
+BC 在相同的下发时间轴上监督，Critic 学习 SDK 实际接受的 `31×7` 目标，折扣按有效控制步计算。
+Actor Q 和 TD bootstrap 都经过同一可微执行变换；中途 HIL、`f` 或回合尾部只保留真实执行步。
 
 learner 继续在独立线程中采样 replay、更新 Actor/Critic，与 rollout 采集异步运行。
-不足 10 步的回合尾样本使用 `valid_mask`：BC 只计算已执行位置，Actor 的 Q 输入也将未执行位置
+不足 31 步的回合尾样本使用 `valid_mask`：BC 只计算已执行位置，Actor 的 Q 输入也将未执行位置
 置零，与 replay 的补齐方式一致。更新次数只能说明 learner 在工作；判断改善应单独统计无 HIL
 回合的成功率，并检查 `debug_obs/episode_*/steps.csv` 和 `hardware_actions.jsonl` 中请求目标与
 实际接受目标的偏差。2026-10-31 的在线检查及历史权重异常见
 [检查报告](outputs/rlt/online_audit_20261031/README.md)。修复代码不会自动修复旧 checkpoint 的异常输出。
-窗口内目标按 30 Hz 下发，跨窗口还需等待同步推理和通信，实际平均动作频率需包含这些等待。
+目标按 30 Hz 下发，实际平均动作频率仍需包含可能的推理、特征提取和通信等待。
 Actor 探索噪声按 chunk 采样一个 7D 向量并广播到 10 步；Actor 输出在归一化空间钳位到 ±1.5。
 Actor 只有在 learner 最近一次 batch 均值 `Q(actor)-Q(reference)` 严格大于
 `actor_gate_advantage` 时才接管，否则保持 VLA；指标日志中的 `referenceQ` 和 `actorAdv`
 可直接判断闸门状态。BC 权重从 warmup 的 10 线性退火到 2.5，Q 权重从 1 退火到 4。
-实验性的动作预取会把较早观测生成的 VLA 参考交给当前状态的 Actor，不用于当前论文对照配置。
+当前预取和密集执行设置用于与本机 VLA 验证对齐，不是原论文的原始控制时间轴。
 
 Stage 2 的 SigLIP 视觉注意力使用 `eager`：本机默认 SDPA 在固定图像的串行对照中存在波动，
 切换后重复特征的最大差值为 0；不修改权重、精度或全局系统配置。
@@ -172,6 +178,10 @@ BC 目标保留完整 reference，执行时始终提供完整 reference。HIL �
 checkpoint 边界内的 replay。先结束并评价当前回合，再按 `q`，等保存 `final_checkpoint.pt` 后用
 新命令恢复；运行中的进程不会自动加载代码变更。若没有 final 文件，改用最近已保存的
 `checkpoint_epN.pt`，从第 N+1 回合继续。旧 replay 保留其原有片段边界，新回合使用新规则。
+执行时间轴首次从旧版迁移到当前设置时，保留 Actor、Actor 优化器、累计计数和回合历史，
+重新初始化 Critic/target/优化器；旧 replay 只用于 BC，不伪造 31 步 TD 样本。
+新的 `aligned_critic_updates` 从 0 开始，用于接管就绪和 BC/Q 退火；至少需要 256 条新执行数据和
+1,000 次对齐更新，并满足 Q 优势条件后才允许 Actor 接管。同一时间轴的后续恢复会完整恢复两个网络。
 目录包含 `train.log`、`rl_metrics.log`、replay journal、训练 checkpoint、`hardware_info.json`
 及 `hardware_actions.jsonl`；动作日志和 replay 使用 SDK 实际接受的限速目标。
 换 VLA 时须重新准备配套 prefix/encoder，不能只换推理 checkpoint。

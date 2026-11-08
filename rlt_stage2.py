@@ -555,8 +555,8 @@ def run(args):
         command.extend(["--resume_from", str(args.resume_from.resolve())])
     if getattr(args, "auto_critical", False):
         command.append("--auto_critical")
-    if getattr(args, "async_inference", False):
-        command.append("--async_inference")
+    if getattr(args, "async_inference", None) is not None:
+        command.append("--async_inference" if args.async_inference else "--no-async_inference")
     if not getattr(args, "rtc_enabled", True):
         command.append("--no-rtc_enabled")
     if getattr(args, "rtc_mode", None) is not None:

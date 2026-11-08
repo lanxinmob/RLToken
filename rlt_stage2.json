@@ -57,10 +57,12 @@
     "cam_wrist": "observation.images.cam_wrist"
   },
   "control_fps": 30,
+  "exec_grid_hz": 100,
+  "start_blend_steps": 3,
   "rtc_enabled": true,
   "rtc_mode": "guided",
   "rtc_execution_horizon": 10,
-  "async_inference": false,
+  "async_inference": true,
   "replan_every_window": true,
   "inference_timeout_s": 2.0,
   "manual_positioning": true,

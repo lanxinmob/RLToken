@@ -62,6 +62,7 @@ from rlt_core import *  # noqa: F401,F403  (shared runtime core, see rlt_core.py
 # sampling need them here, hence the explicit import.
 from rlt_core import COLLECTION_PHASE_ONLINE, COLLECTION_PHASE_WARMUP  # noqa: F401
 from rlt_action_transform import (
+    ActionTimeline,
     AcceptedActionTransform,
     EXECUTION_CONTRACT,
     EXECUTION_STATE_KEY,
@@ -428,6 +429,7 @@ class DeferredBoundarySnapshot:
     step_id: int
     raw_actions: torch.Tensor | None = None
     raw_action_index: int = 0
+    grid_phase: float = 0.0
 
 
 @dataclass
@@ -785,14 +787,35 @@ def build_transition(
         raise ValueError("Requested action shape does not match executed action shape")
     requested[:window.executed_steps] = requested_stacked
     refs = window.boundary.ref_chunk.detach().cpu().squeeze(0).float().clone()
-    if refs.shape != (horizon, action_dim):
-        raise ValueError(f"Reference chunk shape {tuple(refs.shape)} != {(horizon, action_dim)}")
+    if refs.ndim != 2 or refs.shape[-1] != action_dim:
+        raise ValueError(f"Invalid model reference chunk shape {tuple(refs.shape)}")
+    dense_reference = window.boundary.reference_targets
+    reference_targets = (refs.clone() if dense_reference is None
+                         else dense_reference.detach().cpu().reshape(horizon, action_dim).float().clone())
+    if reference_targets.shape != (horizon, action_dim):
+        raise ValueError("Reference target timeline does not match command horizon")
     source_chunk = np.full(horizon, int(TransitionSource.BASE), dtype=np.uint8)
     source_chunk[:window.executed_steps] = np.asarray(window.sources, dtype=np.uint8)
     # Algorithm 1: an intervention replaces the VLA reference in replay.
     for index, source in enumerate(window.sources):
         if source == int(TransitionSource.HUMAN):
-            refs[index] = actions[index]
+            reference_targets[index] = requested[index]
+            if len(refs) == horizon:
+                refs[index] = actions[index]
+    if len(refs) != horizon:
+        # Algorithm 1: human actions also replace the actor's model-space
+        # reference. Interpolate the measured command trace back to C points;
+        # the BC loss itself stays on actual command ticks, with its own mask.
+        timing = window.boundary.execution_timing
+        phase = float(window.boundary.preparation["phase"].reshape(-1)[0])
+        positions = (np.arange(len(refs)) - phase) * float(timing[3] / timing[2])
+        nearest = np.rint(positions).astype(int).clip(0, window.executed_steps - 1)
+        for row, command in enumerate(nearest):
+            if window.sources[command] == int(TransitionSource.HUMAN):
+                refs[row] = torch.tensor([
+                    np.interp(positions[row], np.arange(window.executed_steps), requested[:window.executed_steps, dim])
+                    for dim in range(action_dim)
+                ], dtype=refs.dtype)
     valid_mask = np.zeros(horizon, dtype=np.bool_)
     valid_mask[:window.executed_steps] = True
     rewards = np.zeros(horizon, dtype=np.float32)
@@ -820,7 +843,29 @@ def build_transition(
         step_id=window.boundary.step_id,
         execution_state=window.boundary.execution_state,
         next_execution_state=next_boundary.execution_state,
+        reference_targets=reference_targets.numpy(),
+        preparation=preparation_to_numpy(window.boundary.preparation),
+        next_preparation=preparation_to_numpy(next_boundary.preparation),
+        execution_timing=window.boundary.execution_timing,
     )
+
+
+def preparation_to_numpy(preparation):
+    return None if preparation is None else {
+        key: value.detach().cpu().numpy().squeeze(0) for key, value in preparation.items()
+    }
+
+
+def batch_preparation(batch, *, next_state=False):
+    prefix = "next_prepare_" if next_state else "prepare_"
+    return {key: batch[prefix + key] for key in ("context", "context_valid", "phase", "blend_anchor", "blend_weights")}
+
+
+def needs_stride_snapshot(index: int, horizon: int, stride: int) -> bool:
+    # A 31-tick horizon has odd endpoints for even stride starts. Capture both
+    # starts and ends; looking up only stride multiples silently loses every
+    # complete dense transition.
+    return index % stride == 0 or (index >= horizon and (index - horizon) % stride == 0)
 
 
 def order_episode_transitions(transitions: list[Transition]) -> list[Transition]:
@@ -865,6 +910,7 @@ def build_stride2_transitions(
 
     transitions: list[Transition] = []
     short_episode = len(records) < horizon
+    has_aligned_terminal = not short_episode and (len(records) - horizon) % stride == 0
     last_possible_start = len(records) - 1
     for start_idx in range(0, len(records), stride):
         if start_idx > last_possible_start:
@@ -882,7 +928,7 @@ def build_stride2_transitions(
             # Complete final window ends at the terminal observation.
             end_snapshot = terminal_snapshot
         elif terminal_snapshot is not None and (
-            short_episode or start_idx + stride > len(records)
+            short_episode or (not has_aligned_terminal and start_idx + stride >= len(records))
         ):
             # Short episode (< horizon steps): pad every stride start with the
             # terminal observation. Otherwise only the last partial tail is
@@ -918,7 +964,9 @@ def build_stride2_transitions(
         # the VLA reference).
         for index, record in enumerate(records[start_idx:end_idx]):
             if record.ref_row is not None and record.source != int(TransitionSource.HUMAN):
-                transition.ref_chunk[index] = record.ref_row.detach().cpu().numpy()
+                transition.reference_targets[index] = record.ref_row.detach().cpu().numpy()
+                if len(transition.ref_chunk) == horizon:
+                    transition.ref_chunk[index] = record.ref_row.detach().cpu().numpy()
         transitions.append(transition)
     return transitions
 
@@ -1271,15 +1319,56 @@ class ReplayBuffer:
         return self._size
 
 
+def migrate_replay_timing(transition: Transition, timeline: ActionTimeline) -> Transition:
+    """Preserve old demonstrations for BC; never invent an RL execution trace."""
+    if (transition.execution_timing is not None
+            and np.array_equal(transition.execution_timing, timeline.signature)
+            and len(transition.action_chunk) == timeline.steps
+            and transition.preparation is not None and transition.next_preparation is not None):
+        return transition
+    old_steps = len(transition.action_chunk)
+    old_requests = transition.action_chunk if transition.requested_chunk is None else transition.requested_chunk
+    positions = np.linspace(0, old_steps - 1, timeline.steps)
+
+    def interpolate(values):
+        return np.stack([np.interp(positions, np.arange(old_steps), values[:, dim])
+                         for dim in range(values.shape[-1])], axis=-1).astype(np.float32)
+
+    transition.action_chunk = interpolate(transition.action_chunk)
+    transition.requested_chunk = interpolate(old_requests)
+    valid = np.interp(positions, np.arange(old_steps), transition.valid_mask.astype(float)) >= 1 - 1e-6
+    transition.valid_mask = valid
+    transition.executed_steps = int(valid.sum())
+    transition.source_chunk = transition.source_chunk[np.rint(positions).astype(int)]
+    reward = float(transition.rewards.sum())
+    transition.rewards = np.zeros(timeline.steps, dtype=np.float32)
+    if transition.done and transition.executed_steps:
+        transition.rewards[transition.executed_steps - 1] = reward
+    for next_state in (False, True):
+        ref = torch.as_tensor(transition.next_ref_chunk if next_state else transition.ref_chunk).unsqueeze(0)
+        metadata = timeline.metadata(ref, 0, step_id=timeline.start_blend_steps)
+        if next_state:
+            transition.next_preparation = preparation_to_numpy(metadata)
+        else:
+            transition.preparation = preparation_to_numpy(metadata)
+            transition.reference_targets = timeline.prepare(ref, metadata)[0].numpy()
+    # Interpolated legacy rows are geometry-only demonstrations. Their old
+    # controller anchors and rewards must not enter the new temporal TD loss.
+    transition.execution_state = transition.next_execution_state = None
+    transition.execution_timing = timeline.signature.copy()
+    return transition
+
+
 class ReplayManager:
     """Append-only replay journal. Restore is explicit; writes are disk-first."""
 
-    def __init__(self, buffer: ReplayBuffer, journal_path: str, *, restore: bool = False):
+    def __init__(self, buffer: ReplayBuffer, journal_path: str, *, restore: bool = False, timeline=None):
         self._buffer = buffer
         self._journal_path = journal_path
         self._lock = threading.Lock()
         self._adds_total = 0
         self._execution_adds_total = 0
+        self._timeline = timeline
         os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
         if restore:
             self._restore_from_journal()
@@ -1353,7 +1442,17 @@ class ReplayManager:
                         step_id=int(record["step_id"]),
                         execution_state=(record["execution_state"] if record.get("execution_valid", False) else None),
                         next_execution_state=(record["next_execution_state"] if record.get("next_execution_valid", False) else None),
+                        reference_targets=record.get("reference_targets"),
+                        preparation=({key: record["prepare_" + key] for key in
+                                      ("context", "context_valid", "phase", "blend_anchor", "blend_weights")}
+                                     if record.get("prepare_context", np.empty(0)).size else None),
+                        next_preparation=({key: record["next_prepare_" + key] for key in
+                                           ("context", "context_valid", "phase", "blend_anchor", "blend_weights")}
+                                          if record.get("next_prepare_context", np.empty(0)).size else None),
+                        execution_timing=record.get("execution_timing"),
                     )
+                    if self._timeline is not None:
+                        t = migrate_replay_timing(t, self._timeline)
                     self._buffer.add(t)
                     restored += 1
                     execution_restored += int(t.execution_state is not None and (t.next_execution_state is not None or t.done))
@@ -1800,7 +1899,7 @@ def atomic_torch_save(payload: dict, path: Path) -> None:
 
 def build_stage2_checkpoint(**payload) -> dict:
     return {
-        "schema_version": 3,
+        "schema_version": 4 if payload.get("execution_timing") is not None else 3,
         "resume_supported": True,
         "actor_contract": "paper_full_output_v1",
         "rl_chunk_length": 10,
@@ -1893,7 +1992,7 @@ def prepare_resume_checkpoint(path: Path, output_dir: Path, *, dry_run: bool) ->
     }
     missing = sorted(required - set(checkpoint))
     if (
-        checkpoint.get("schema_version") != 3
+        checkpoint.get("schema_version") not in (3, 4)
         or not checkpoint.get("resume_supported")
         or checkpoint.get("actor_contract") != "paper_full_output_v1"
         or checkpoint.get("rl_chunk_length") != 10
@@ -2028,8 +2127,7 @@ def parse_args():
                         help="Ease from the measured pose into the plan over N control steps at "
                              "episode start; keeps the first chunk from jumping to the model target")
     parser.add_argument("--exec_grid_hz", type=float, default=None,
-                        help="Execution-only dense resampling grid; requires --vla_only. "
-                             "100 plays each 30 Hz chunk as ~3.3x denser points at the same tick rate")
+                        help="Resampling grid shared by VLA, Actor and learner; commands still run at control_fps")
     parser.add_argument("--vla_only", action="store_true",
                         help="Disable actor execution; frozen VLA + leader takeover only")
     parser.add_argument("--inference_only", action="store_true",
@@ -2225,9 +2323,8 @@ def parse_args():
                              "observation for each 10-step RL window by default. "
                              "Disable to reuse a full cached 50-step plan instead.")
     parser.add_argument("--async_inference", action=argparse.BooleanOptionalAction, default=False,
-                        help="Experimental VLA prefetch from an earlier observation; its reference "
-                             "timing differs from the Actor's boundary state. Disabled for the "
-                             "paper baseline; requires replan_every_window and RTC off.")
+                        help="Prefetch the next VLA reference with RTC guidance; requires replan_every_window. "
+                             "The Actor uses that plan with the current boundary state.")
     parser.add_argument("--inference_timeout_s", type=float, default=2.0,
                         help="Maximum interruptible wait for an asynchronous plan; hold the last "
                              "target while late, then stop on timeout.")
@@ -2327,10 +2424,8 @@ def main():
     if args.start_blend_steps < 0:
         raise ValueError("--start_blend_steps must be non-negative.")
     if args.exec_grid_hz is not None:
-        if args.exec_grid_hz <= 0:
-            raise ValueError("--exec_grid_hz must be positive.")
-        if not args.vla_only:
-            raise ValueError("--exec_grid_hz is an execution-only validation grid; pass --vla_only.")
+        if args.exec_grid_hz <= 0 or not math.isfinite(args.exec_grid_hz):
+            raise ValueError("--exec_grid_hz must be finite and positive.")
     if args.actor_residual_scale != 0:
         raise ValueError("Paper-aligned RLT uses a full-output Actor; --actor_residual_scale must be 0.")
     if args.actor_action_limit <= 0 or not math.isfinite(args.actor_action_limit):
@@ -2651,6 +2746,20 @@ def main():
             return quantile_unnormalize(action_norm, action_q01_cpu, action_q99_cpu)
         return quantile_unnormalize(action_norm, action_q01, action_q99)
 
+    timeline = ActionTimeline(
+        rlt_config.n_action_steps_rl,
+        float(hardware_config["action_hz"]) if hardware_config is not None else args.control_fps,
+        args.exec_grid_hz or args.control_fps, args.control_fps,
+        args.chunk_smooth_taps, args.start_blend_steps,
+    )
+    command_horizon = timeline.steps
+    timing_changed = resume_checkpoint is not None and resume_checkpoint.get("execution_timing") != timeline.profile()
+    logger.info(
+        "Shared execution timeline: model=%.1f Hz | grid=%.1f Hz | commands=%.1f Hz | "
+        "%d model actions -> %d commands (%.3fs); FIR=%d, startup blend=%d commands",
+        timeline.action_hz, timeline.grid_hz, timeline.tick_hz, timeline.model_steps,
+        command_horizon, command_horizon / timeline.tick_hz, timeline.smooth_taps, timeline.start_blend_steps,
+    )
     critic_execution_dim = 2 * rlt_config.action_dim if args.hardware_backend == "rlt_stage2" else 0
     critic_proprio_dim = rlt_config.state_dim + critic_execution_dim
 
@@ -2669,12 +2778,17 @@ def main():
         normalized_anchor = quantile_normalize(execution_state, action_q01, action_q99)
         return torch.cat([batch[state_key], normalized_anchor.flatten(start_dim=1)], dim=-1)
 
-    def critic_action(batch: dict[str, torch.Tensor], action: torch.Tensor, *, next_state: bool = False) -> torch.Tensor:
+    def critic_action(batch: dict[str, torch.Tensor], action: torch.Tensor, *, next_state: bool = False,
+                      reference: bool = False) -> torch.Tensor:
         """Map a normalized proposal into the same action domain the critic sees."""
         if action_transform is not None:
             execution_key = "next_execution_state" if next_state else "execution_state"
-            return action_transform(action, batch[execution_key], batch["valid_mask"])
-        return action.masked_fill(~batch["valid_mask"].bool().unsqueeze(-1), 0.0)
+            return action_transform(action, batch[execution_key], batch["valid_mask"],
+                                    preparation=batch_preparation(batch, next_state=next_state),
+                                    execution_scale=1.0 if reference else args.actor_execution_scale)
+        prepared = timeline.prepare(action, batch_preparation(batch, next_state=next_state),
+                                    execution_scale=1.0 if reference else args.actor_execution_scale)
+        return prepared.masked_fill(~batch["valid_mask"].bool().unsqueeze(-1), 0.0)
 
     # ── Create actor + critic ───────────────────────────────────────────
     actor = RLTChunkActor(
@@ -2692,12 +2806,14 @@ def main():
         hidden_dim=args.critic_hidden_dim,
         num_layers=args.critic_num_layers,
         proprio_dim=critic_proprio_dim,
+        action_steps=command_horizon,
     ).to(device)
     critic_target = RLTTwinCritic(
         rlt_config,
         hidden_dim=args.critic_hidden_dim,
         num_layers=args.critic_num_layers,
         proprio_dim=critic_proprio_dim,
+        action_steps=command_horizon,
     ).to(device)
     critic_target.load_state_dict(critic.state_dict())
     for p in critic_target.parameters():
@@ -2727,7 +2843,7 @@ def main():
             # Older checkpoints either omitted this field or stored ``None``
             # before the execution-anchor critic contract was introduced.
             saved_critic_proprio_dim = rlt_config.state_dim
-        if saved_critic_proprio_dim != critic_proprio_dim:
+        if not timing_changed and saved_critic_proprio_dim != critic_proprio_dim:
             legacy_arx = (
                 args.hardware_backend == "rlt_stage2"
                 and saved_critic_proprio_dim == rlt_config.state_dim
@@ -2753,10 +2869,18 @@ def main():
             )
         actor.load_state_dict(resume_checkpoint["actor_state_dict"], strict=True)
         actor_target.load_state_dict(resume_checkpoint["actor_target_state_dict"], strict=True)
-        critic.load_state_dict(resume_checkpoint["critic_state_dict"], strict=True)
-        critic_target.load_state_dict(resume_checkpoint["critic_target_state_dict"], strict=True)
         actor_optimizer.load_state_dict(resume_checkpoint["actor_optimizer"])
-        critic_optimizer.load_state_dict(resume_checkpoint["critic_optimizer"])
+        if timing_changed:
+            logger.warning(
+                "Execution timing changed on resume (%s -> %s): keeping Actor/optimizer and episode history; "
+                "reinitializing Critic/target/optimizer. Old replay is retained for BC only; "
+                "Actor readiness requires fresh aligned updates.",
+                resume_checkpoint.get("execution_timing", "legacy command windows"), timeline.profile(),
+            )
+        else:
+            critic.load_state_dict(resume_checkpoint["critic_state_dict"], strict=True)
+            critic_target.load_state_dict(resume_checkpoint["critic_target_state_dict"], strict=True)
+            critic_optimizer.load_state_dict(resume_checkpoint["critic_optimizer"])
         move_optimizer_state_to_device(actor_optimizer, device)
         move_optimizer_state_to_device(critic_optimizer, device)
         logger.info("Loaded residual Stage 2 checkpoint from %s", args.resume_from)
@@ -2785,6 +2909,7 @@ def main():
         buffer,
         journal_path=str(output_dir / "replay_journal.pkl"),
         restore=resume_checkpoint is not None or restore_replay is not None,
+        timeline=timeline,
     )
     if restore_replay is not None and resume_checkpoint is None:
         # Restore a previous run's journal into this new run (fresh weights).
@@ -2969,15 +3094,14 @@ def main():
                     profile, stats["action"]["q01"], stats["action"]["q99"],
                     device=device, execution_scale=args.actor_execution_scale,
                     smooth_taps=args.chunk_smooth_taps,
+                    timeline=timeline,
                 )
                 logger.info("Actor/Critic execution domain: %s; fixed policy step budget %.6fs; "
                             "chunk smoothing taps %s",
                             EXECUTION_CONTRACT, profile["step_dt_s"], args.chunk_smooth_taps)
                 logger.info(
                     "Execution smoothing: %s",
-                    "full chunk before slicing (vla-only)"
-                    if args.vla_only and args.chunk_smooth_taps > 1
-                    else "per-window (training-compatible)",
+                    "full-plan context before slicing/resampling; identical for VLA, Actor, BC and Q",
                 )
                 logger.info("Replay with controller state: %s/%s; legacy replay retained for BC only.",
                             buffer.stats()["execution_entries"], len(buffer))
@@ -3406,6 +3530,8 @@ def main():
                     execution_scale=args.actor_execution_scale,
                     critic_proprio_dim=critic_proprio_dim,
                     aligned_critic_updates=aligned_critic_updates,
+                    execution_timing=timeline.profile(),
+                    critic_action_steps=command_horizon,
                     actor_gate_advantage=latest_actor_advantage,
                     runtime_provenance=runtime_provenance,
                     rng_state=capture_rng_state(),
@@ -3473,12 +3599,12 @@ def main():
         )
         aligned_critic_updates = (
             int(resume_checkpoint.get("aligned_critic_updates", 0))
-            if resume_checkpoint is not None and resume_checkpoint.get("execution_contract") == EXECUTION_CONTRACT
+            if resume_checkpoint is not None and not timing_changed and resume_checkpoint.get("execution_contract") == EXECUTION_CONTRACT
             else 0
         )
         resume_advantage = (
             float(resume_checkpoint["actor_gate_advantage"])
-            if resume_checkpoint is not None and resume_checkpoint.get("actor_gate_advantage") is not None
+            if resume_checkpoint is not None and not timing_changed and resume_checkpoint.get("actor_gate_advantage") is not None
             else None
         )
         if resume_checkpoint is not None and action_transform is not None:
@@ -3609,14 +3735,15 @@ def main():
                     k: v.to(device) for k, v in replay.sample_batch(args.batch_size).items()
                 }
 
-                if total_updates < args.learner_warmup_updates:
+                schedule_updates = aligned_critic_updates if action_transform is not None else total_updates
+                if schedule_updates < args.learner_warmup_updates:
                     weight_progress = 0.0
                 elif args.weight_anneal_updates == 0:
                     weight_progress = 1.0
                 else:
                     weight_progress = min(
                         1.0,
-                        max(0.0, (total_updates - args.learner_warmup_updates)
+                        max(0.0, (schedule_updates - args.learner_warmup_updates)
                             / args.weight_anneal_updates),
                     )
                 bc_weight = (
@@ -3653,12 +3780,14 @@ def main():
                             next_action = action_transform(
                                 next_action,
                                 batch["next_execution_state"][bootstrap],
-                                batch["valid_mask"][bootstrap],
+                                preparation=batch_preparation(
+                                    {key: value[bootstrap] for key, value in batch.items()}, next_state=True,
+                                ),
                             )
                         else:
-                            next_action = next_action.masked_fill(
-                                ~batch["valid_mask"][bootstrap].bool().unsqueeze(-1), 0.0,
-                            )
+                            next_action = timeline.prepare(next_action, batch_preparation(
+                                {key: value[bootstrap] for key, value in batch.items()}, next_state=True,
+                            ))
                         target_q[bootstrap] = critic_target.q_min(
                             batch["next_z_rl"][bootstrap], critic_proprio(batch, next_state=True)[bootstrap], next_action,
                         )
@@ -3728,7 +3857,7 @@ def main():
                         ).mean()
                         reference_q = critic.q_min(
                             batch["z_rl"].detach(), critic_proprio(batch),
-                            critic_action(batch, batch["ref_chunk"]),
+                            critic_action(batch, batch["ref_chunk"], reference=True),
                         ).mean()
                     actor_advantage = actor_q - reference_q
                     latest_actor_advantage = float(actor_advantage.detach())
@@ -3745,16 +3874,21 @@ def main():
                     valid_mask_f = bc_batch["valid_mask"].float()
 
                     bc_target = torch.where(
-                        human_mask.unsqueeze(-1), bc_batch["requested_chunk"], bc_batch["ref_chunk"]
+                        human_mask.unsqueeze(-1), bc_batch["requested_chunk"], bc_batch["reference_targets"]
                     )
-                    bc_error = (sampled_action - bc_target).pow(2).mean(dim=-1)
+                    prepared_sample = timeline.prepare(
+                        sampled_action, batch_preparation(bc_batch), execution_scale=args.actor_execution_scale,
+                    )
+                    bc_error = (prepared_sample - bc_target).pow(2).mean(dim=-1)
                     bc_penalty = (bc_error * valid_mask_f).sum() / valid_mask_f.sum().clamp_min(1.0)
                     rl_stats["bc"].append(float(bc_penalty.detach()))
 
                     # Smoothness term is kept in code but disabled by default
                     # for strict paper alignment (delta_weight = 0).
                     ad = rlt_config.action_dim
-                    pred_absolute = unnormalize_action(action_mean[..., :ad])
+                    pred_absolute = unnormalize_action(timeline.prepare(
+                        action_mean, batch_preparation(bc_batch), execution_scale=args.actor_execution_scale,
+                    )[..., :ad])
                     target_absolute = unnormalize_action(bc_target[..., :ad])
                     pred_delta = pred_absolute[:, 1:] - pred_absolute[:, :-1]
                     target_delta = target_absolute[:, 1:] - target_absolute[:, :-1]
@@ -4132,6 +4266,7 @@ def main():
             stride_mt_lock = threading.Lock()
             stride_mt_thread: threading.Thread | None = None
             stride_mt_error: Exception | None = None
+            startup_blend_anchor: torch.Tensor | None = None
 
             def capture_boundary_snapshot(context: str, step_id: int) -> DeferredBoundarySnapshot | None:
                 obs = read_follower_observation(context)
@@ -4192,6 +4327,7 @@ def main():
                 prev_chunk_left_over: torch.Tensor | None = None,
                 raw_actions: torch.Tensor | None = None,
                 raw_action_index: int = 0,
+                grid_phase: float = 0.0,
             ) -> BoundaryContext:
                 # When raw_actions are cached (stride-2 / HIL snapshot
                 # materialization), skip the action diffusion and only recompute
@@ -4210,6 +4346,12 @@ def main():
                     start_index=raw_action_index,
                     num_steps=rlt_config.n_action_steps_rl,
                 )
+                preparation = timeline.metadata(
+                    raw_actions[:, :, :rlt_config.action_dim], raw_action_index,
+                    phase=grid_phase, step_id=step_id,
+                    blend_anchor=(normalize_action(state.detach().cpu()).to(raw_actions)
+                                  if startup_blend_anchor is None else startup_blend_anchor.to(raw_actions)),
+                )
                 return BoundaryContext(
                     z_rl=z_rl.detach(),
                     proprio=normalize_state(state)[:rlt_config.state_dim].detach(),
@@ -4219,6 +4361,9 @@ def main():
                     step_id=step_id,
                     execution_state=execution_state_from_observation(obs),
                     measured_state=state[:rlt_config.state_dim].detach().cpu().clone(),
+                    preparation=preparation,
+                    reference_targets=timeline.prepare(ref_chunk, preparation),
+                    execution_timing=timeline.signature.copy(),
                 )
 
             def materialize_snapshot(snapshot: DeferredBoundarySnapshot) -> BoundaryContext:
@@ -4232,6 +4377,7 @@ def main():
                     snapshot.step_id,
                     raw_actions=snapshot.raw_actions,
                     raw_action_index=snapshot.raw_action_index,
+                    grid_phase=snapshot.grid_phase,
                 )
 
             def start_stride_materialization() -> None:
@@ -4272,6 +4418,7 @@ def main():
                                     snap.step_id,
                                     raw_actions=snap.raw_actions,
                                     raw_action_index=snap.raw_action_index,
+                                    grid_phase=snap.grid_phase,
                                 )
                                 stride_materialized[key] = ctx
                     except (KeyError, ValueError, RuntimeError) as exc:
@@ -4301,6 +4448,7 @@ def main():
                                 snap.step_id,
                                 raw_actions=snap.raw_actions,
                                 raw_action_index=snap.raw_action_index,
+                                grid_phase=snap.grid_phase,
                             )
                             stride_materialized[key] = ctx
                         except (KeyError, ValueError, RuntimeError) as exc:
@@ -4325,7 +4473,7 @@ def main():
                         hil_materialized = materialize_deferred_windows(
                             batch,
                             materialize_snapshot,
-                            horizon=rlt_config.n_action_steps_rl,
+                            horizon=command_horizon,
                             action_dim=rlt_config.action_dim,
                         )
                     except (KeyError, ValueError, RuntimeError) as exc:
@@ -4511,29 +4659,8 @@ def main():
             if hardware is not None:
                 hardware.set_phase("policy")
 
-            # Calculate real execution ticks per block. Dense-grid validation
-            # expands the ten model actions to an interpolated command window;
-            # its larger window length must also drive the episode budget.
-            steps_per_block = rlt_config.n_action_steps_rl
-            if args.actor_execution_steps > 0:
-                steps_per_block = min(args.actor_execution_steps, rlt_config.n_action_steps_rl)
-            if args.exec_grid_hz:
-                action_hz = float(hardware_config["action_hz"]) if hardware_config is not None else float(args.control_fps)
-                steps_per_block = resampled_chunk_length(
-                    rlt_config.n_action_steps_rl,
-                    source_hz=action_hz,
-                    target_hz=float(args.exec_grid_hz),
-                )
-            max_rollout_blocks = args.steps_per_episode // steps_per_block
-            if max_rollout_blocks < 1:
-                raise ValueError(
-                    "--steps_per_episode must be at least steps_per_block so every replay row is real."
-                )
-            if args.steps_per_episode % steps_per_block:
-                logger.warning(
-                    "Ignoring final %d control steps so every execution window is complete.",
-                    args.steps_per_episode % steps_per_block,
-                )
+            steps_per_block = command_horizon
+            max_rollout_blocks = math.ceil(args.steps_per_episode / steps_per_block)
             # Synchronized HIL takeover offset (follower - leader, backend physical
             # units). Set at
             # each takeover; HUMAN targets are leader_pose + hil_offset so the
@@ -4542,10 +4669,10 @@ def main():
 
             step = 0
             horizon_extension_announced = False
-            while step < max_rollout_blocks or CRITICAL_PHASE_ACTIVE:
+            while episode_step_counter < args.steps_per_episode or CRITICAL_PHASE_ACTIVE:
                 if SHUTDOWN or EMERGENCY_STOP or SKIP_EPISODE or FINISH_EPISODE:
                     break
-                if step >= max_rollout_blocks and not horizon_extension_announced:
+                if episode_step_counter >= args.steps_per_episode and not horizon_extension_announced:
                     horizon_extension_announced = True
                     message = (
                         "[KEY] Critical phase still active at the episode horizon; "
@@ -4731,17 +4858,16 @@ def main():
 
                     human_actions: list[torch.Tensor] = []
                     human_requests: list[torch.Tensor] = []
-                    human_resume_requested = False
+                    human_critical_active = CRITICAL_PHASE_ACTIVE and not (args.vla_only or args.inference_only)
                     # The first samples after pressing 'h' are a handoff
                     # interval.  They are intentionally consumed only to
                     # advance the feedback sequence; no action step or replay
                     # row is created until the operator has moved the arm.
-                    while len(human_actions) < rlt_config.n_action_steps_rl:
-                        if SHUTDOWN or EMERGENCY_STOP:
+                    while len(human_actions) < command_horizon:
+                        if SHUTDOWN or EMERGENCY_STOP or FINISH_EPISODE or SKIP_EPISODE:
                             break
                         if HIL_FORCE_RESUME or HIL_TOGGLE_REQUESTED or teleop.consume_resume_request():
                             HIL_FORCE_RESUME = True
-                            human_resume_requested = True
                             break
                         sample = teleop.wait_for_fresh_sample(
                             max_age_s=0.25,
@@ -4791,10 +4917,10 @@ def main():
                             logger.error("Invalid leader target: %s", exc)
                             SHUTDOWN = True
                             break
-                        if CRITICAL_PHASE_ACTIVE:
+                        if human_critical_active:
                             if critical_step_counter is None:
                                 critical_step_counter = 0
-                            if critical_step_counter % replay_stride == 0:
+                            if needs_stride_snapshot(critical_step_counter, command_horizon, replay_stride):
                                 if critical_step_counter not in stride_snapshots:
                                     stride_snapshot = capture_boundary_snapshot(
                                         "stride boundary", episode_step_counter,
@@ -4818,7 +4944,7 @@ def main():
                         human_actions.append(normalized_action)
                         human_requests.append(normalized_request)
                         intervention_steps += 1
-                        if CRITICAL_PHASE_ACTIVE:
+                        if human_critical_active:
                             if critical_step_counter is None:
                                 # CRITICAL_PHASE_ACTIVE is toggled by the console
                                 # thread ('c') and may flip mid-chunk, so the
@@ -4833,6 +4959,8 @@ def main():
                             ))
                             critical_step_counter += 1
                         episode_step_counter += 1
+                        if not human_critical_active and episode_step_counter >= args.steps_per_episode:
+                            break
                         remaining_dt = target_dt - (time.time() - step_start)
                         if remaining_dt > 0:
                             time.sleep(remaining_dt)
@@ -4840,10 +4968,6 @@ def main():
 
                     if SHUTDOWN:
                         break
-                    if human_resume_requested:
-                        # Leave HIL resolution to the normal top-of-loop path;
-                        # no partial static handoff is emitted as replay.
-                        continue
                     if not human_actions:
                         # A clean 's'/'h' during the handoff may leave no human
                         # action at all.  Keep the episode alive and let the
@@ -4852,7 +4976,7 @@ def main():
                     end_snapshot = capture_boundary_snapshot("HIL chunk boundary", episode_step_counter)
                     if end_snapshot is None:
                         break
-                    if collect_hil_data and CRITICAL_PHASE_ACTIVE and not args.exec_grid_hz:
+                    if collect_hil_data and human_critical_active:
                         deferred_windows.append(DeferredExecutionWindow(
                             start=start_snapshot,
                             end=end_snapshot,
@@ -5075,6 +5199,22 @@ def main():
                     start_index=action_index,
                     num_steps=rlt_config.n_action_steps_rl,
                 ).to(device)
+                grid_start = command_index_for_model_step(
+                    full_plan_start, command_hz=timeline.grid_hz, action_hz=timeline.action_hz,
+                )
+                full_grid_length = resampled_chunk_length(
+                    full_plan_actions.shape[1], source_hz=timeline.action_hz, target_hz=timeline.grid_hz,
+                )
+                grid_start = min(grid_start, max(0, full_grid_length - command_horizon))
+                grid_phase = grid_start * timeline.action_hz / timeline.grid_hz - full_plan_start
+                if episode_step_counter == 0:
+                    startup_blend_anchor = normalize_action(state_tensor).detach().cpu().clone()
+                preparation = timeline.metadata(
+                    full_plan_actions[:, :, :rlt_config.action_dim], full_plan_start,
+                    phase=grid_phase, step_id=episode_step_counter,
+                    blend_anchor=(normalize_action(state_tensor) if startup_blend_anchor is None
+                                  else startup_blend_anchor.to(ref_actions)),
+                )
                 boundary = BoundaryContext(
                     z_rl=z_rl.detach(),
                     proprio=normalize_state(state_tensor)[:rlt_config.state_dim].detach(),
@@ -5084,24 +5224,21 @@ def main():
                     step_id=episode_step_counter,
                     execution_state=execution_state_from_observation(obs),
                     measured_state=state_tensor[:rlt_config.state_dim].detach().cpu().clone(),
+                    preparation=preparation,
+                    reference_targets=timeline.prepare(ref_actions, preparation).detach(),
+                    execution_timing=timeline.signature.copy(),
                 )
                 if pending_policy_window is not None:
                     episode_transitions.append(build_transition(
                         pending_policy_window, boundary,
-                        horizon=rlt_config.n_action_steps_rl,
+                        horizon=command_horizon,
                         action_dim=rlt_config.action_dim,
                         terminal=not CRITICAL_PHASE_ACTIVE,
                     ))
                     pending_policy_window = None
 
-                # Consecutive critical-phase CONTROL steps: the actor may only
-                # take control after --actor_critical_delay_steps control steps
-                # of sustained critical phase, so transient auto-detector false
-                # positives cannot grab control from VLA. The counter advances by
-                # one window (n_action_steps_rl = 10 control steps) per boundary.
-                _critical_sustained_steps = (
-                    _critical_sustained_steps + rlt_config.n_action_steps_rl if CRITICAL_PHASE_ACTIVE else 0
-                )
+                if not CRITICAL_PHASE_ACTIVE:
+                    _critical_sustained_steps = 0
                 if (
                     not CRITICAL_PHASE_ACTIVE
                     or _critical_sustained_steps < args.actor_critical_delay_steps
@@ -5139,8 +5276,6 @@ def main():
                             requested_actions = clamp_actor_action(
                                 requested_actions, args.actor_action_limit,
                             )
-                            if args.actor_execution_scale != 1.0:
-                                requested_actions = requested_actions * args.actor_execution_scale
                     action_source = "ACTOR"
                     current_source = int(TransitionSource.RL)
                     episode_actor_executed = True  # the Actor intervened in this episode (took over execution)
@@ -5152,111 +5287,32 @@ def main():
                 window = ExecutionWindow(boundary)
                 # c takes effect at a window boundary. Record the entire last
                 # active window, including actions already committed to it.
-                window_critical_active = CRITICAL_PHASE_ACTIVE and not args.exec_grid_hz
+                window_critical_active = CRITICAL_PHASE_ACTIVE and not (args.vla_only or args.inference_only)
                 takeover_during_chunk = False
-                # Determine how many steps to execute before re-planning
-                steps_to_execute = rlt_config.n_action_steps_rl
+                # One preparation path for VLA, Actor, BC and the TD target.
+                # Replace only C model actions; preserve the full VLA plan's
+                # left/right FIR context and its resampling phase.
+                requested_targets = unnormalize_action(timeline.prepare(
+                    requested_actions.detach().cpu(),
+                    {key: value.detach().cpu() for key, value in boundary.preparation.items()},
+                    execution_scale=args.actor_execution_scale if action_source == "ACTOR" else 1.0,
+                ))
+                steps_to_execute = command_horizon
                 if action_source == "ACTOR" and args.actor_execution_steps > 0:
-                    steps_to_execute = min(args.actor_execution_steps, rlt_config.n_action_steps_rl)
-                # All per-tick work below is on CPU. In particular, do not copy
-                # an individual waypoint or replay snapshot from CUDA while the
-                # next diffusion is queued on the same device.
-                #
-                # Zero-phase FIR has edge transients.  Smoothing only the ten
-                # executed actions puts the first and last targets on opposite
-                # filter edges, which biases them in opposite directions at
-                # every window boundary.  In vla-only execution, smooth the full
-                # policy chunk first (the 10-action slice is then in the filter
-                # interior), matching pi0.5's full-chunk processing.  The
-                # training path keeps the per-window transform so Q targets stay
-                # consistent with AcceptedActionTransform.
-                full_chunk_smoothing = (
-                    bool(args.vla_only)
-                    and args.chunk_smooth_taps > 1
-                    and full_plan_actions is not None
-                    and full_plan_start + rlt_config.n_action_steps_rl
-                    <= full_plan_actions.shape[1]
-                )
-                action_hz_for_grid = (
-                    float(hardware_config["action_hz"])
-                    if hardware_config is not None else float(args.control_fps)
-                )
-                if full_chunk_smoothing:
-                    full_physical = unnormalize_action(full_plan_actions.detach().cpu())
-                    full_smoothed = smooth_actions_torch(
-                        full_physical, args.chunk_smooth_taps,
-                        joints=rlt_config.action_dim - 1,
+                    steps_to_execute = resampled_chunk_length(
+                        min(args.actor_execution_steps, rlt_config.n_action_steps_rl),
+                        source_hz=timeline.action_hz, target_hz=timeline.grid_hz,
                     )
-                    model_head = full_smoothed[
-                        :, full_plan_start:full_plan_start + rlt_config.n_action_steps_rl
-                    ].clone()
-                    raw_head = model_head[0, :6]
-                    if args.exec_grid_hz:
-                        # pi0.5 resamples the whole 50-action chunk, then
-                        # executes a command slice starting at the plan age.
-                        # Slicing the 10-action window first and resampling it
-                        # shifts the phase by the plan-age rounding.
-                        grid_hz = float(args.exec_grid_hz)
-                        full_resampled = resample_chunk(
-                            full_smoothed, source_hz=action_hz_for_grid, target_hz=grid_hz,
-                        )
-                        window_len = resampled_chunk_length(
-                            rlt_config.n_action_steps_rl,
-                            source_hz=action_hz_for_grid, target_hz=grid_hz,
-                        )
-                        grid_start = command_index_for_model_step(
-                            full_plan_start, command_hz=grid_hz, action_hz=action_hz_for_grid,
-                        )
-                        grid_start = min(
-                            grid_start, max(0, full_resampled.shape[1] - window_len),
-                        )
-                        window_len = min(window_len, full_resampled.shape[1] - grid_start)
-                        requested_targets = full_resampled[
-                            :, grid_start:grid_start + window_len
-                        ].clone()
-                        steps_to_execute = window_len
-                    else:
-                        requested_targets = model_head
-                else:
-                    requested_targets = unnormalize_action(requested_actions.detach().cpu())
-                    # Same kernel runs inside the training-side execution
-                    # transform, so Q sees what the arm runs.
-                    requested_targets = smooth_actions_torch(
-                        requested_targets, args.chunk_smooth_taps,
-                        joints=rlt_config.action_dim - 1,
-                    )
-                    raw_head = requested_targets[0, :6]
-                    if args.exec_grid_hz:
-                        requested_targets = resample_chunk(
-                            requested_targets,
-                            source_hz=action_hz_for_grid,
-                            target_hz=float(args.exec_grid_hz),
-                        )
-                        steps_to_execute = int(requested_targets.shape[1])
-                if args.start_blend_steps > 0 and episode_step_counter == 0:
-                    if boundary.measured_state is None:
-                        raise RuntimeError("Start blending requires a physical boundary state")
-                    requested_targets = blend_start_targets(
-                        requested_targets,
-                        boundary.measured_state,
-                        int(args.start_blend_steps),
-                        joint_count=min(6, rlt_config.action_dim),
-                    )
-                if args.exec_grid_hz and plan_head_log is not None:
+                if not CRITICAL_PHASE_ACTIVE:
+                    steps_to_execute = min(steps_to_execute, args.steps_per_episode - episode_step_counter)
+                if plan_head_log is not None:
                     plan_head_log.write(json.dumps({
-                        "episode_step": episode_step_counter,
-                        "source": action_source,
-                        "window_steps": steps_to_execute,
-                        "raw_head": [round(float(v), 4) for v in raw_head.flatten().tolist()],
-                        "resampled_head": [
-                            round(float(v), 4) for v in requested_targets[0, :6, 0].tolist()
-                        ],
-                        "resampled_j1_head": [
-                            round(float(v), 4) for v in requested_targets[0, :6, 1].tolist()
-                        ],
+                        "episode_step": episode_step_counter, "source": action_source,
+                        "window_steps": steps_to_execute, "grid_phase": grid_phase,
+                        "resampled_head": requested_targets[0, :6, 0].tolist(),
                     }) + "\n")
-                    plan_head_log.flush()
-                window_raw_actions = action_cache.raw_actions.detach().cpu()
+                window_raw_actions = full_plan_actions.detach().cpu()
+                reference_command_rows = boundary.reference_targets.detach().cpu()[0]
                 window_sent_at = []
                 execution_grid_hz = float(args.exec_grid_hz or args.control_fps)
                 # The loop still advances one point per control tick, so the
@@ -5276,14 +5332,16 @@ def main():
                     if window_critical_active:
                         if critical_step_counter is None:
                             critical_step_counter = 0
-                        if critical_step_counter % replay_stride == 0:
+                        if needs_stride_snapshot(critical_step_counter, command_horizon, replay_stride):
                             if critical_step_counter not in stride_snapshots:
                                 stride_snapshot = capture_boundary_snapshot(
                                     "stride boundary", episode_step_counter,
                                 )
                                 if stride_snapshot is not None:
                                     stride_snapshot.raw_actions = window_raw_actions
-                                    stride_snapshot.raw_action_index = action_index + action_offset
+                                    coordinate = (grid_start + action_offset) * timeline.action_hz / timeline.grid_hz
+                                    stride_snapshot.raw_action_index = int(math.floor(coordinate + 1e-9))
+                                    stride_snapshot.grid_phase = coordinate - stride_snapshot.raw_action_index
                                 if stride_snapshot is not None:
                                     stride_snapshots[critical_step_counter] = stride_snapshot
                                     with stride_mt_lock:
@@ -5405,6 +5463,8 @@ def main():
                         current_source,
                         requested_action=normalized_request,
                     )
+                    if CRITICAL_PHASE_ACTIVE:
+                        _critical_sustained_steps += 1
                     if window_critical_active:
                         if critical_step_counter is None:
                             # The window owns its collection state even when
@@ -5416,19 +5476,7 @@ def main():
                             intervention=False,
                             step_id=episode_step_counter,
                             requested_action=normalized_request,
-                            # Per-step VLA reference: the raw chunk covering this
-                            # step, aligned to the step's offset in that chunk.
-                            # This keeps stride windows that cross a re-plan
-                            # boundary aligned row-by-row (each executed action
-                            # is compared against the reference of the chunk it
-                            # actually came from, not the window-start chunk).
-                            ref_row=(
-                                window_raw_actions[
-                                    :, action_index + action_offset, :rlt_config.action_dim
-                                ].detach().squeeze(0).clone()
-                                if window_raw_actions is not None
-                                else None
-                            ),
+                            ref_row=reference_command_rows[action_offset].clone(),
                         ))
                         critical_step_counter += 1
                     episode_step_counter += 1
@@ -5447,7 +5495,7 @@ def main():
                 # forces a fresh plan at every window; in --no-replan_every_window
                 # (full-chunk) mode this is what keeps a partial actor window from
                 # reusing the old plan's suffix.
-                if action_source == "ACTOR" and args.actor_execution_steps > 0 and window.executed_steps < rlt_config.n_action_steps_rl:
+                if action_source == "ACTOR" and args.actor_execution_steps > 0 and window.executed_steps < command_horizon:
                     action_cache.clear()
 
                 if takeover_during_chunk:
@@ -5475,9 +5523,9 @@ def main():
                 # For VLA or full-chunk Actor, expect full execution.
                 # For partial-chunk Actor (receding horizon), expect partial execution.
                 expected_steps = steps_to_execute
+                pending_policy_window = window if window_critical_active and window.executed_steps else None
                 if window.executed_steps < expected_steps:
                     break
-                pending_policy_window = window if window_critical_active else None
 
                 if (step - 1) % 10 == 0:
                     logger.info(
@@ -5633,7 +5681,7 @@ def main():
                     episode_transitions.append(build_transition(
                         terminal_pending_window,
                         terminal_boundary,
-                        horizon=rlt_config.n_action_steps_rl,
+                        horizon=command_horizon,
                         action_dim=rlt_config.action_dim,
                         terminal=True,
                     ))
@@ -5651,7 +5699,7 @@ def main():
                         step_records,
                         stride_snapshots,
                         terminal_snapshot,
-                        horizon=rlt_config.n_action_steps_rl,
+                        horizon=command_horizon,
                         action_dim=rlt_config.action_dim,
                         stride=replay_stride,
                         materialize_snapshot=materialize_snapshot,

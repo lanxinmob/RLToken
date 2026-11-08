@@ -138,8 +138,21 @@ class ActionTimeline:
             if (weights < 1).any():
                 raise ValueError("Startup blend requires the measured physical pose normalized as an action")
             blend_anchor = torch.zeros(batch, dimension, **options)
+        indices = torch.cat([
+            torch.arange(model_start - self.pad, model_start, device=full_actions.device),
+            torch.arange(model_start + self.model_steps, model_start + self.model_steps + self.pad,
+                         device=full_actions.device),
+        ])
         return {
             "context": self.context(full_actions, model_start),
+            # A padded full-plan endpoint depends on the Actor only when the
+            # replacement includes that endpoint. For a slice starting at 1,
+            # negative FIR indices still replicate the frozen VLA action 0.
+            "context_valid": (~(
+                ((indices < 0) & (model_start == 0))
+                | ((indices >= full_actions.shape[1])
+                   & (model_start + self.model_steps >= full_actions.shape[1]))
+            )).to(full_actions).expand(batch, -1),
             "phase": torch.full((batch,), float(phase), **options),
             "blend_anchor": torch.as_tensor(blend_anchor, **options).reshape(batch, dimension),
             "blend_weights": weights,
@@ -152,7 +165,13 @@ class ActionTimeline:
         context = metadata["context"].to(actions)
         if context.shape != (actions.shape[0], 2 * self.pad, actions.shape[-1]):
             raise ValueError("Invalid full-plan smoothing context")
-        full = torch.cat([context[:, :self.pad], actions * execution_scale, context[:, self.pad:]], dim=1)
+        actions = actions * execution_scale
+        edge = torch.cat([actions[:, :1].expand(-1, self.pad, -1),
+                          actions[:, -1:].expand(-1, self.pad, -1)], dim=1)
+        # At the actual full-plan ends, FIR edge replication belongs to the
+        # replacement Actor endpoint too; it must not retain the old VLA value.
+        context = torch.where(metadata["context_valid"].to(actions).unsqueeze(-1) > .5, context, edge)
+        full = torch.cat([context[:, :self.pad], actions, context[:, self.pad:]], dim=1)
         full = smooth_actions_torch(full, self.smooth_taps)
         coordinates = (
             torch.arange(self.steps, device=actions.device, dtype=actions.dtype)[None]
@@ -167,7 +186,7 @@ class ActionTimeline:
         result = result + full.gather(1, right.unsqueeze(-1).expand(*shape)) * fraction
         weights = metadata["blend_weights"].to(actions).unsqueeze(-1)
         anchor = metadata["blend_anchor"].to(actions).unsqueeze(1)
-        # Keep the gripper unblended, matching pi0.5 inference.
+        # Keep the gripper unblended, matching Stage 2 vla-only execution.
         return torch.cat([anchor[..., :-1] + weights * (result[..., :-1] - anchor[..., :-1]),
                           result[..., -1:]], dim=-1)
 

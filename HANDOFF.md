@@ -1,5 +1,23 @@
 # ARX5 RLT 接手上下文（2026-10-30）
 
+## 2026-11-09 在线训练执行对齐
+
+根入口 `./rlt stage2 --auto-critical --episodes 200` 已默认使用与 `--vla-only` 相同的
+100 Hz 重采样网格、30 Hz 下发、完整计划 FIR=5、异步 RTC 和启动 3 次关节目标混合。
+Actor/reference 保留 10 个模型动作；Critic、replay、BC、奖励折扣统一为 31 个实际下发位置。
+replay 保存滤波上下文、网格相位、启动混合和当前/下一边界的执行状态，Actor Q 与 TD 使用同一变换。
+31 步窗口的 stride=2 采集同时保留奇数终点；HIL 退出和 `f` 不丢弃已执行的部分窗口。
+
+checkpoint 新执行格式为 schema 4。旧格式恢复保留 Actor/优化器和回合历史，重置 Critic/优化器，
+旧 replay 只保留为 BC；新时间轴的 aligned 更新数与退火从 0 开始，接管仍需新数据和 Q 优势。
+相同时间轴后续恢复完整保留两个网络；原始 journal/checkpoint 不改写。
+
+验证包括 82 项原有相关测试、144 组完整计划/Actor 置换对照、27,566 条真实旧 replay 的只读迁移、
+混合 HIL/终止/stride replay 的有限梯度更新，以及真实冻结模型配合内存硬件替身的完整 trainer 流程。
+后者覆盖 3 次尝试保留 2 回合、Actor 执行、HIL 返回、discard 不计数、RTC 预取和 schema 4 恢复。
+旧 checkpoint 根入口只读预检通过；未连接 CAN，未验证真机平滑度和任务成功率。
+本机证据在 `outputs/rlt/online_alignment_20261109/`；临时验证脚本验证后删除。
+
 ## 2026-10-31 在线 RL 检查
 
 检查 `stage2_arx_20261031_230555/checkpoint_ep105.pt`：learner 和 Actor 下发均实际运行，

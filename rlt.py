@@ -100,17 +100,16 @@ def main():
             online.add_argument("--vla-only", dest="vla_only", action="store_true",
                                 help="Deployment validation: VLA executes, no actor/critic updates")
             online.add_argument("--exec-grid-hz", dest="exec_grid_hz", type=float, default=None,
-                                help="Execution-only dense grid; requires --vla-only "
-                                     "(100 => ~3.3x denser points at the same tick rate)")
+                                help="Shared VLA/Actor/learner resampling grid (config: 100 Hz; commands: 30 Hz)")
             online.add_argument("--no-preview", action="store_true",
                                 help="Disable the live OpenCV camera window")
             online.add_argument("--async-inference", "--async_inference",
-                                dest="async_inference", action="store_true",
+                                dest="async_inference", action=argparse.BooleanOptionalAction, default=None,
                                 help="Plan the next VLA chunk in a background thread instead of "
                                      "blocking the control loop at every chunk boundary")
             online.add_argument("--no-rtc-enabled", "--no-rtc_enabled",
                                 dest="rtc_enabled", action="store_false",
-                                help="Disable RTC guidance; required by --async-inference")
+                                help="Disable RTC guidance")
             online.add_argument("--rtc-mode", "--rtc_mode", dest="rtc_mode",
                                 choices=["guided", "trained"],
                                 help="RTC mode override (ARX Stage 2 uses guided)")
