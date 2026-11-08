@@ -218,6 +218,11 @@ class Transition:
     requested_chunk: np.ndarray | None = None  # pre-SDK requested targets, normalized
     execution_state: np.ndarray | None = None  # physical (previous, filtered) targets
     next_execution_state: np.ndarray | None = None
+    # Model reference stays C rows; accepted targets/rewards use command ticks.
+    reference_targets: np.ndarray | None = None
+    preparation: dict[str, np.ndarray] | None = None
+    next_preparation: dict[str, np.ndarray] | None = None
+    execution_timing: np.ndarray | None = None
 
     def to_numpy(self) -> dict[str, np.ndarray]:
         return {
@@ -255,7 +260,23 @@ class Transition:
             ),
             "execution_valid": _ensure_array(self.execution_state is not None, dtype=np.bool_),
             "next_execution_valid": _ensure_array(self.next_execution_state is not None, dtype=np.bool_),
+            "reference_targets": _ensure_array(
+                self.ref_chunk if self.reference_targets is None else self.reference_targets, dtype=np.float32,
+            ),
+            "execution_timing": _ensure_array(
+                np.zeros(7) if self.execution_timing is None else self.execution_timing, dtype=np.float32,
+            ),
+            **self._preparation_arrays(self.preparation, "prepare_"),
+            **self._preparation_arrays(self.next_preparation, "next_prepare_"),
         }
+
+    def _preparation_arrays(self, preparation, prefix):
+        dimension = self.action_chunk.shape[-1]
+        values = preparation if preparation is not None else {
+            "context": np.zeros((0, dimension)), "phase": 0.0,
+            "blend_anchor": np.zeros(dimension), "blend_weights": np.ones(len(self.action_chunk)),
+        }
+        return {prefix + key: _ensure_array(value, dtype=np.float32) for key, value in values.items()}
 
 
 @dataclass
@@ -323,6 +344,9 @@ class BoundaryContext:
     # Physical follower state at this boundary (ARX rad/m). ``proprio`` is
     # quantile-normalized and must never be mixed with plan targets.
     measured_state: torch.Tensor | None = None
+    preparation: dict[str, torch.Tensor] | None = None
+    reference_targets: torch.Tensor | None = None
+    execution_timing: np.ndarray | None = None
 
 
 @dataclass

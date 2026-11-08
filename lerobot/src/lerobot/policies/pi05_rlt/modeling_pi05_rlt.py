@@ -309,7 +309,8 @@ class RLTTwinCritic(nn.Module):
     Same lightweight MLP family as the actor (paper-aligned, keys ``q1.*`` /
     ``q2.*`` matching the RL-Token-Pi05 Stage-2 trained checkpoints).  The
     optional ``proprio_dim`` lets hardware-aware training append the physical
-    execution anchor without changing the legacy critic contract.
+    execution anchor. ``action_steps`` selects the accepted command horizon
+    independently of the actor's model waypoint count.
     """
 
     def __init__(
@@ -318,6 +319,7 @@ class RLTTwinCritic(nn.Module):
         hidden_dim: int | None = None,
         num_layers: int | None = None,
         proprio_dim: int | None = None,
+        action_steps: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -341,7 +343,7 @@ class RLTTwinCritic(nn.Module):
 
         z_dim = int(getattr(config, "rlt_hidden_dim", 256))
         action_dim = int(getattr(config, "action_dim", 6))
-        chunk = int(getattr(config, "n_action_steps_rl", 10))
+        chunk = int(action_steps if action_steps is not None else getattr(config, "n_action_steps_rl", 10))
 
         self.action_dim = action_dim
         self.chunk = chunk

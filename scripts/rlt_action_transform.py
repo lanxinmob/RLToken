@@ -82,16 +82,107 @@ def smooth_actions_torch(actions, taps: int, *, joints=None):
     return torch.cat([smoothed, actions[..., joints:]], dim=-1)
 
 
+class ActionTimeline:
+    """Model waypoints -> command window, shared by rollout, BC and Q.
+
+    The grid controls interpolation density; tick_hz controls physical time.
+    Context contains the frozen VLA flanks around the actor's model window.
+    Keeping those flanks and the fractional grid phase makes slicing a full
+    smoothed plan identical to preparing an actor replacement of that slice.
+    """
+
+    def __init__(self, model_steps, action_hz, grid_hz, tick_hz, smooth_taps=0, start_blend_steps=0):
+        if not all(np.isfinite(v) and v > 0 for v in (action_hz, grid_hz, tick_hz)):
+            raise ValueError("Action, grid and command rates must be finite and positive")
+        if grid_hz < action_hz:
+            raise ValueError("Execution grid must be at least the model action rate")
+        smoothing_kernel(smooth_taps)
+        self.model_steps = int(model_steps)
+        self.action_hz, self.grid_hz, self.tick_hz = map(float, (action_hz, grid_hz, tick_hz))
+        self.smooth_taps = int(smooth_taps)
+        self.start_blend_steps = int(start_blend_steps)
+        self.steps = int(np.floor((self.model_steps - 1) * self.grid_hz / self.action_hz + 1e-9)) + 1
+        # One additional point is needed to interpolate a fractional final row.
+        self.pad = self.smooth_taps // 2 + 1 if self.smooth_taps > 1 else 1
+        self.signature = np.asarray([
+            1, self.model_steps, self.action_hz, self.grid_hz, self.tick_hz,
+            self.smooth_taps, self.start_blend_steps,
+        ], dtype=np.float32)
+
+    def profile(self):
+        return dict(zip(
+            ("version", "model_steps", "action_hz", "grid_hz", "tick_hz", "smooth_taps", "start_blend_steps"),
+            self.signature.tolist(),
+        ))
+
+    def context(self, full_actions, model_start):
+        import torch
+
+        indices = torch.cat([
+            torch.arange(model_start - self.pad, model_start, device=full_actions.device),
+            torch.arange(model_start + self.model_steps, model_start + self.model_steps + self.pad,
+                         device=full_actions.device),
+        ]).clamp(0, full_actions.shape[1] - 1)
+        return full_actions.index_select(1, indices)
+
+    def metadata(self, full_actions, model_start, *, phase=0.0, step_id=0, blend_anchor=None):
+        import torch
+
+        batch, _, dimension = full_actions.shape
+        options = {"dtype": full_actions.dtype, "device": full_actions.device}
+        weights = torch.ones(batch, self.steps, **options)
+        if self.start_blend_steps:
+            weights = ((torch.arange(self.steps, **options) + step_id + 1) / self.start_blend_steps).clamp(max=1)
+            weights = weights.unsqueeze(0).expand(batch, -1)
+        if blend_anchor is None:
+            if (weights < 1).any():
+                raise ValueError("Startup blend requires the measured physical pose normalized as an action")
+            blend_anchor = torch.zeros(batch, dimension, **options)
+        return {
+            "context": self.context(full_actions, model_start),
+            "phase": torch.full((batch,), float(phase), **options),
+            "blend_anchor": torch.as_tensor(blend_anchor, **options).reshape(batch, dimension),
+            "blend_weights": weights,
+        }
+
+    def prepare(self, actions, metadata, *, execution_scale=1.0):
+        """Differentiable normalized pre-SDK targets, including startup blending."""
+        import torch
+
+        context = metadata["context"].to(actions)
+        if context.shape != (actions.shape[0], 2 * self.pad, actions.shape[-1]):
+            raise ValueError("Invalid full-plan smoothing context")
+        full = torch.cat([context[:, :self.pad], actions * execution_scale, context[:, self.pad:]], dim=1)
+        full = smooth_actions_torch(full, self.smooth_taps)
+        coordinates = (
+            torch.arange(self.steps, device=actions.device, dtype=actions.dtype)[None]
+            * (self.action_hz / self.grid_hz)
+            + metadata["phase"].to(actions).reshape(-1, 1) + self.pad
+        )
+        left = coordinates.floor().long().clamp(0, full.shape[1] - 1)
+        right = (left + 1).clamp_max(full.shape[1] - 1)
+        fraction = (coordinates - left).unsqueeze(-1)
+        shape = (-1, -1, actions.shape[-1])
+        result = full.gather(1, left.unsqueeze(-1).expand(*shape)) * (1 - fraction)
+        result = result + full.gather(1, right.unsqueeze(-1).expand(*shape)) * fraction
+        weights = metadata["blend_weights"].to(actions).unsqueeze(-1)
+        anchor = metadata["blend_anchor"].to(actions).unsqueeze(1)
+        # Keep the gripper unblended, matching pi0.5 inference.
+        return torch.cat([anchor[..., :-1] + weights * (result[..., :-1] - anchor[..., :-1]),
+                          result[..., -1:]], dim=-1)
+
+
 class AcceptedActionTransform:
     """Differentiable normalized chunk -> normalized SDK accepted targets."""
 
     def __init__(self, profile, action_q01, action_q99, *, device="cpu", execution_scale=1.0,
-                 smooth_taps: int = 0):
+                 smooth_taps: int = 0, timeline=None):
         import torch
 
         if profile["contract"] != EXECUTION_CONTRACT:
             raise ValueError(f"Unsupported execution transform: {profile['contract']}")
         self.profile = profile
+        self.timeline = timeline
         self.smooth_taps = int(smooth_taps)
         if self.smooth_taps > 1 and self.smooth_taps % 2 == 0:
             raise ValueError("chunk smooth taps must be odd (0 disables smoothing)")
@@ -103,14 +194,18 @@ class AcceptedActionTransform:
         self.upper = torch.as_tensor(profile["upper"], dtype=torch.float32, device=device)
         self.alpha = float(profile["alpha"])
 
-    def __call__(self, requested, execution_state, valid_mask=None):
+    def __call__(self, requested, execution_state, valid_mask=None, *, preparation=None, execution_scale=None):
         import torch
 
         if execution_state.shape != (requested.shape[0], 2, requested.shape[-1]):
             raise ValueError("Execution state must contain previous and filtered physical targets")
-        requested = smooth_actions_torch(requested, self.smooth_taps)
+        scale = self.execution_scale if execution_scale is None else float(execution_scale)
+        if self.timeline is not None:
+            requested = self.timeline.prepare(requested, preparation, execution_scale=scale)
+        else:
+            requested = smooth_actions_torch(requested, self.smooth_taps) * scale
         previous, filtered = execution_state[:, 0], execution_state[:, 1]
-        physical = (requested * self.execution_scale + 1.0) * self.span / 2.0 + self.q01
+        physical = (requested + 1.0) * self.span / 2.0 + self.q01
         result = []
         for index in range(requested.shape[1]):
             accepted = accepted_target(
