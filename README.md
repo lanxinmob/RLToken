@@ -13,6 +13,11 @@ bash setup_arx.sh
 
 最后一条会连接配置中的执行臂和相机。启动前核对 CAN、标定与工作空间，停止占用同一机械臂的其他控制程序。Stage 2 使用 `.venv`，硬件进程使用配置中指定的 SDK Python。
 
+`rlt_stage2.json` 中的 `actor_handoff_steps` 默认为 5。VLA → Actor、Actor → Actor 和 Actor → VLA
+换块时，六个关节从控制器最后接受的位置出发，用最近两条已接受指令估算起始速度，做三次插值。
+第 5 个控制周期接回新块原定的位置和速度（30 Hz 下约 167 ms），夹爪沿用原定时序。
+设为 0 可关闭换块过渡。`start_blend_steps` 单独控制回合起步。
+
 要在 Rerun 中查看相机、VLA 目标、Actor 选中目标和 SDK 实际接受的目标，可运行：
 
 ```bash
