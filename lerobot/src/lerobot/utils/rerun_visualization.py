@@ -21,6 +21,7 @@ importing from here directly. Requires the ``viz`` extra (``pip install 'lerobot
 
 import numbers
 import os
+import shutil
 
 import numpy as np
 
@@ -61,7 +62,10 @@ def init_rerun(
     if ip and port:
         rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
     else:
-        rr.spawn(memory_limit=memory_limit)
+        # The release binary is commonly installed as ``rerun-cli`` while the
+        # Python SDK searches for ``rerun`` by default.
+        viewer_path = shutil.which("rerun") or shutil.which("rerun-cli")
+        rr.spawn(memory_limit=memory_limit, executable_path=viewer_path)
 
 
 def shutdown_rerun() -> None:
