@@ -166,7 +166,13 @@ class RerunVisualizationManager:
         next_log_time = 0.0
         while self._running:
             with self._condition:
-                while self._running and self._observation is None and self._action is None:
+                while (
+                    self._running
+                    and self._observation is None
+                    and self._action is None
+                    and self._debug_observation is None
+                    and self._debug_action is None
+                ):
                     self._condition.wait(timeout=0.1)
                 if not self._running:
                     return

@@ -54,6 +54,7 @@ def init_rerun(
     import rerun as rr
 
     log_rerun_data.blueprint = None  # Reset blueprint cache for new session
+    log_rerun_data._known_paths = None
 
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
@@ -97,18 +98,35 @@ def _build_blueprint(observation_paths: set[str], action_paths: set[str], image_
 
 
 def _ensure_blueprint(observation_paths: set[str], action_paths: set[str], image_paths: set[str]) -> None:
-    """Build and send the blueprint once, from the first observation and action data."""
-    if getattr(log_rerun_data, "blueprint", None) is not None:
+    if not (observation_paths or action_paths or image_paths):
         return
 
-    if not (observation_paths or action_paths or image_paths):
+    known_paths = getattr(log_rerun_data, "_known_paths", None)
+    if known_paths is None:
+        known_paths = {
+            "observation": set(),
+            "action": set(),
+            "image": set(),
+            "signature": None,
+        }
+        log_rerun_data._known_paths = known_paths
+    known_paths["observation"].update(observation_paths)
+    known_paths["action"].update(action_paths)
+    known_paths["image"].update(image_paths)
+    signature = tuple(
+        tuple(sorted(known_paths[name])) for name in ("observation", "action", "image")
+    )
+    if getattr(log_rerun_data, "blueprint", None) is not None and signature == known_paths["signature"]:
         return
 
     # Safe + zero-overhead: `log_rerun_data` already ran the `require_package` guard and imported rerun.
     import rerun as rr
 
-    blueprint = _build_blueprint(observation_paths, action_paths, image_paths)
+    blueprint = _build_blueprint(
+        known_paths["observation"], known_paths["action"], known_paths["image"],
+    )
     log_rerun_data.blueprint = blueprint
+    known_paths["signature"] = signature
     rr.send_blueprint(blueprint)
 
 
