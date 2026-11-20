@@ -430,6 +430,7 @@ class DeferredBoundarySnapshot:
     raw_actions: torch.Tensor | None = None
     raw_action_index: int = 0
     grid_phase: float = 0.0
+    handoff: tuple[torch.Tensor, torch.Tensor, bool] | None = None
 
 
 @dataclass
@@ -858,7 +859,7 @@ def preparation_to_numpy(preparation):
 
 def batch_preparation(batch, *, next_state=False):
     prefix = "next_prepare_" if next_state else "prepare_"
-    return {key: batch[prefix + key] for key in ("context", "context_valid", "phase", "blend_anchor", "blend_weights")}
+    return {key[len(prefix):]: value for key, value in batch.items() if key.startswith(prefix)}
 
 
 def needs_stride_snapshot(index: int, horizon: int, stride: int) -> bool:
@@ -1359,6 +1360,23 @@ def migrate_replay_timing(transition: Transition, timeline: ActionTimeline) -> T
     return transition
 
 
+def restore_handoff(preparation, history, end_step):
+    """Recover the two preceding accepted policy commands from an overlapping legacy window."""
+    if preparation is None or "handoff" in preparation or history is None:
+        return
+    end = end_step - history.step_id
+    if end < 2 or end > history.executed_steps:
+        return
+    source = history.source_chunk[end - 1]
+    if source not in (TransitionSource.BASE, TransitionSource.RL):
+        return
+    position = history.action_chunk[end - 1]
+    delta = position - history.action_chunk[end - 2]
+    if history.source_chunk[end - 2] == TransitionSource.HUMAN:
+        delta = np.zeros_like(position)
+    preparation.update(handoff=np.stack([position, delta]), previous_policy=source)
+
+
 class ReplayManager:
     """Append-only replay journal. Restore is explicit; writes are disk-first."""
 
@@ -1408,6 +1426,7 @@ class ReplayManager:
             return
         restored = 0
         execution_restored = 0
+        previous = None
         try:
             with open(self._journal_path, "rb") as f:
                 while True:
@@ -1443,16 +1462,19 @@ class ReplayManager:
                         execution_state=(record["execution_state"] if record.get("execution_valid", False) else None),
                         next_execution_state=(record["next_execution_state"] if record.get("next_execution_valid", False) else None),
                         reference_targets=record.get("reference_targets"),
-                        preparation=({key: record["prepare_" + key] for key in
-                                      ("context", "context_valid", "phase", "blend_anchor", "blend_weights")}
+                        preparation=(batch_preparation(record)
                                      if record.get("prepare_context", np.empty(0)).size else None),
-                        next_preparation=({key: record["next_prepare_" + key] for key in
-                                           ("context", "context_valid", "phase", "blend_anchor", "blend_weights")}
+                        next_preparation=(batch_preparation(record, next_state=True)
                                           if record.get("next_prepare_context", np.empty(0)).size else None),
                         execution_timing=record.get("execution_timing"),
                     )
                     if self._timeline is not None:
                         t = migrate_replay_timing(t, self._timeline)
+                        if self._timeline.actor_handoff_steps and t.execution_state is not None:
+                            if previous is not None and previous.episode_id == t.episode_id:
+                                restore_handoff(t.preparation, previous, t.step_id)
+                            restore_handoff(t.next_preparation, t, t.step_id + t.executed_steps)
+                        previous = t
                     self._buffer.add(t)
                     restored += 1
                     execution_restored += int(t.execution_state is not None and (t.next_execution_state is not None or t.done))
@@ -2126,6 +2148,8 @@ def parse_args():
     parser.add_argument("--start_blend_steps", type=int, default=0,
                         help="Ease from the measured pose into the plan over N control steps at "
                              "episode start; keeps the first chunk from jumping to the model target")
+    parser.add_argument("--actor_handoff_steps", type=int, default=0,
+                        help="Join policy chunks involving the Actor over N command ticks (0 disables)")
     parser.add_argument("--exec_grid_hz", type=float, default=None,
                         help="Resampling grid shared by VLA, Actor and learner; commands still run at control_fps")
     parser.add_argument("--vla_only", action="store_true",
@@ -2423,6 +2447,8 @@ def main():
         raise ValueError("--async_inference requires --replan_every_window.")
     if args.start_blend_steps < 0:
         raise ValueError("--start_blend_steps must be non-negative.")
+    if args.actor_handoff_steps < 0:
+        raise ValueError("--actor_handoff_steps must be non-negative.")
     if args.exec_grid_hz is not None:
         if args.exec_grid_hz <= 0 or not math.isfinite(args.exec_grid_hz):
             raise ValueError("--exec_grid_hz must be finite and positive.")
@@ -2750,15 +2776,16 @@ def main():
         rlt_config.n_action_steps_rl,
         float(hardware_config["action_hz"]) if hardware_config is not None else args.control_fps,
         args.exec_grid_hz or args.control_fps, args.control_fps,
-        args.chunk_smooth_taps, args.start_blend_steps,
+        args.chunk_smooth_taps, args.start_blend_steps, args.actor_handoff_steps,
     )
     command_horizon = timeline.steps
     timing_changed = resume_checkpoint is not None and resume_checkpoint.get("execution_timing") != timeline.profile()
     logger.info(
         "Shared execution timeline: model=%.1f Hz | grid=%.1f Hz | commands=%.1f Hz | "
-        "%d model actions -> %d commands (%.3fs); FIR=%d, startup blend=%d commands",
+        "%d model actions -> %d commands (%.3fs); FIR=%d, startup blend=%d, Actor handoff=%d commands",
         timeline.action_hz, timeline.grid_hz, timeline.tick_hz, timeline.model_steps,
         command_horizon, command_horizon / timeline.tick_hz, timeline.smooth_taps, timeline.start_blend_steps,
+        timeline.actor_handoff_steps,
     )
     critic_execution_dim = 2 * rlt_config.action_dim if args.hardware_backend == "rlt_stage2" else 0
     critic_proprio_dim = rlt_config.state_dim + critic_execution_dim
@@ -2785,9 +2812,11 @@ def main():
             execution_key = "next_execution_state" if next_state else "execution_state"
             return action_transform(action, batch[execution_key], batch["valid_mask"],
                                     preparation=batch_preparation(batch, next_state=next_state),
-                                    execution_scale=1.0 if reference else args.actor_execution_scale)
+                                    execution_scale=1.0 if reference else args.actor_execution_scale,
+                                    actor=not reference)
         prepared = timeline.prepare(action, batch_preparation(batch, next_state=next_state),
-                                    execution_scale=1.0 if reference else args.actor_execution_scale)
+                                    execution_scale=1.0 if reference else args.actor_execution_scale,
+                                    actor=not reference)
         return prepared.masked_fill(~batch["valid_mask"].bool().unsqueeze(-1), 0.0)
 
     # ── Create actor + critic ───────────────────────────────────────────
@@ -3214,6 +3243,7 @@ def main():
             return {f"{JOINT_NAMES[i]}.pos": float(values[i]) for i in range(rlt_config.action_dim)}
 
         last_valid_target: dict[str, float] | None = None
+        policy_handoff: tuple[torch.Tensor, torch.Tensor, bool] | None = None
 
         observation_faulted = False
         observation_fault_reason: str | None = None
@@ -3255,7 +3285,7 @@ def main():
                 return None
 
         def send_validated_action(action_tensor: torch.Tensor, source: str) -> torch.Tensor | None:
-            nonlocal last_valid_target, robot_faulted
+            nonlocal last_valid_target, robot_faulted, policy_handoff
             if robot_faulted or observation_faulted or EMERGENCY_STOP:
                 return None
             target = tensor_to_robot_action(action_tensor, source)
@@ -3266,6 +3296,15 @@ def main():
                         raise RuntimeError(f"Follower returned invalid sent action: {actual_target!r}")
                     actual_tensor = action_dict_to_tensor(actual_target, f"{source} sent action")
                     last_valid_target = actual_target
+                    if timeline.actor_handoff_steps:
+                        if source in ("VLA", "ACTOR") or (source == "HOLD" and policy_handoff is not None):
+                            position = normalize_action(actual_tensor)
+                            delta = (torch.zeros_like(position) if policy_handoff is None
+                                     else position - policy_handoff[0])
+                            from_actor = policy_handoff[2] if source == "HOLD" else source == "ACTOR"
+                            policy_handoff = (position, delta, from_actor)
+                        else:
+                            policy_handoff = None
                     max_delta = float((actual_tensor - action_tensor.detach().cpu()).abs().max())
                     if max_delta > 1e-4:
                         if hardware is not None:
@@ -3531,6 +3570,7 @@ def main():
                     critic_proprio_dim=critic_proprio_dim,
                     aligned_critic_updates=aligned_critic_updates,
                     execution_timing=timeline.profile(),
+                    actor_handoff_steps=timeline.actor_handoff_steps,
                     critic_action_steps=command_horizon,
                     actor_gate_advantage=latest_actor_advantage,
                     runtime_provenance=runtime_provenance,
@@ -3604,7 +3644,9 @@ def main():
         )
         resume_advantage = (
             float(resume_checkpoint["actor_gate_advantage"])
-            if resume_checkpoint is not None and not timing_changed and resume_checkpoint.get("actor_gate_advantage") is not None
+            if resume_checkpoint is not None and not timing_changed
+            and resume_checkpoint.get("actor_handoff_steps", 0) == timeline.actor_handoff_steps
+            and resume_checkpoint.get("actor_gate_advantage") is not None
             else None
         )
         if resume_checkpoint is not None and action_transform is not None:
@@ -3787,7 +3829,7 @@ def main():
                         else:
                             next_action = timeline.prepare(next_action, batch_preparation(
                                 {key: value[bootstrap] for key, value in batch.items()}, next_state=True,
-                            ))
+                            ), actor=True)
                         target_q[bootstrap] = critic_target.q_min(
                             batch["next_z_rl"][bootstrap], critic_proprio(batch, next_state=True)[bootstrap], next_action,
                         )
@@ -3878,6 +3920,7 @@ def main():
                     )
                     prepared_sample = timeline.prepare(
                         sampled_action, batch_preparation(bc_batch), execution_scale=args.actor_execution_scale,
+                        actor=True,
                     )
                     bc_error = (prepared_sample - bc_target).pow(2).mean(dim=-1)
                     bc_penalty = (bc_error * valid_mask_f).sum() / valid_mask_f.sum().clamp_min(1.0)
@@ -3888,6 +3931,7 @@ def main():
                     ad = rlt_config.action_dim
                     pred_absolute = unnormalize_action(timeline.prepare(
                         action_mean, batch_preparation(bc_batch), execution_scale=args.actor_execution_scale,
+                        actor=True,
                     )[..., :ad])
                     target_absolute = unnormalize_action(bc_target[..., :ad])
                     pred_delta = pred_absolute[:, 1:] - pred_absolute[:, :-1]
@@ -4283,6 +4327,7 @@ def main():
             stride_mt_thread: threading.Thread | None = None
             stride_mt_error: Exception | None = None
             startup_blend_anchor: torch.Tensor | None = None
+            policy_handoff = None
 
             def capture_boundary_snapshot(context: str, step_id: int) -> DeferredBoundarySnapshot | None:
                 obs = read_follower_observation(context)
@@ -4293,7 +4338,8 @@ def main():
                 except ValueError as exc:
                     logger.error("Invalid follower observation at %s: %s", context, exc)
                     return None
-                return DeferredBoundarySnapshot(clone_observation(obs), state.detach().clone(), step_id)
+                return DeferredBoundarySnapshot(clone_observation(obs), state.detach().clone(), step_id,
+                                                handoff=policy_handoff)
 
             def await_pi05_plan(step_id: int) -> PrefetchedPi05Plan | None:
                 """Wait without blocking takeover, feedback, preview or hold commands."""
@@ -4344,6 +4390,7 @@ def main():
                 raw_actions: torch.Tensor | None = None,
                 raw_action_index: int = 0,
                 grid_phase: float = 0.0,
+                handoff: tuple[torch.Tensor, torch.Tensor, bool] | None = None,
             ) -> BoundaryContext:
                 # When raw_actions are cached (stride-2 / HIL snapshot
                 # materialization), skip the action diffusion and only recompute
@@ -4365,6 +4412,7 @@ def main():
                 preparation = timeline.metadata(
                     raw_actions[:, :, :rlt_config.action_dim], raw_action_index,
                     phase=grid_phase, step_id=step_id,
+                    handoff=handoff,
                     blend_anchor=(normalize_action(state.detach().cpu()).to(raw_actions)
                                   if startup_blend_anchor is None else startup_blend_anchor.to(raw_actions)),
                 )
@@ -4394,6 +4442,7 @@ def main():
                     raw_actions=snapshot.raw_actions,
                     raw_action_index=snapshot.raw_action_index,
                     grid_phase=snapshot.grid_phase,
+                    handoff=snapshot.handoff,
                 )
 
             def start_stride_materialization() -> None:
@@ -4428,15 +4477,7 @@ def main():
                             idle_cycles = 0
                             key = id(snap)
                             if key not in stride_materialized:
-                                ctx = infer_boundary(
-                                    snap.observation,
-                                    snap.state,
-                                    snap.step_id,
-                                    raw_actions=snap.raw_actions,
-                                    raw_action_index=snap.raw_action_index,
-                                    grid_phase=snap.grid_phase,
-                                )
-                                stride_materialized[key] = ctx
+                                stride_materialized[key] = materialize_snapshot(snap)
                     except (KeyError, ValueError, RuntimeError) as exc:
                         stride_mt_error = exc
 
@@ -4458,15 +4499,7 @@ def main():
                     key = id(snap)
                     if key not in stride_materialized:
                         try:
-                            ctx = infer_boundary(
-                                snap.observation,
-                                snap.state,
-                                snap.step_id,
-                                raw_actions=snap.raw_actions,
-                                raw_action_index=snap.raw_action_index,
-                                grid_phase=snap.grid_phase,
-                            )
-                            stride_materialized[key] = ctx
+                            stride_materialized[key] = materialize_snapshot(snap)
                         except (KeyError, ValueError, RuntimeError) as exc:
                             stride_mt_error = exc
                 if stride_mt_error is not None:
@@ -4764,6 +4797,7 @@ def main():
                             logger.info("[KEY] Actor takeover STOPPED (human HIL takeover)")
                             print("[KEY] Actor takeover STOPPED; human HIL active", flush=True)
                         human_active = True
+                        policy_handoff = None
                         human_boundary = snapshot
                         teleop.enter_human_mode(args.leader_hil_min_dwell_s)
                         action_cache.clear()
@@ -5228,6 +5262,7 @@ def main():
                 preparation = timeline.metadata(
                     full_plan_actions[:, :, :rlt_config.action_dim], full_plan_start,
                     phase=grid_phase, step_id=episode_step_counter,
+                    handoff=policy_handoff,
                     blend_anchor=(normalize_action(state_tensor) if startup_blend_anchor is None
                                   else startup_blend_anchor.to(ref_actions)),
                 )
@@ -5312,6 +5347,7 @@ def main():
                     requested_actions.detach().cpu(),
                     {key: value.detach().cpu() for key, value in boundary.preparation.items()},
                     execution_scale=args.actor_execution_scale if action_source == "ACTOR" else 1.0,
+                    actor=action_source == "ACTOR",
                 ))
                 steps_to_execute = command_horizon
                 if action_source == "ACTOR" and args.actor_execution_steps > 0:

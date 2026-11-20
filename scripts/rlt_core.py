@@ -312,6 +312,8 @@ class Transition:
             "context": np.zeros((0, dimension)), "context_valid": np.zeros(0), "phase": 0.0,
             "blend_anchor": np.zeros(dimension), "blend_weights": np.ones(len(self.action_chunk)),
         }
+        if "handoff" not in values:
+            values = dict(values, handoff=np.zeros((2, dimension)), previous_policy=-1)
         return {prefix + key: _ensure_array(value, dtype=np.float32) for key, value in values.items()}
 
 
