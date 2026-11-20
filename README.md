@@ -25,6 +25,9 @@ bash setup_arx.sh
 更新次数、Q 值、TD error、BC loss 和 Actor advantage。使用 `--display-fps` 调整刷新率，
 使用 `--display-compressed-images` 节省带宽。可用
 `../pi05/.tools/bin/uv pip install --python .venv/bin/python 'rerun-sdk>=0.24,<0.34'` 安装 Rerun SDK。
+SDK 安装后还需要同版本的 Rerun Viewer。Linux x86_64 可下载
+`rerun-cli-0.33.1-x86_64-unknown-linux-gnu` 放到 `~/.local/bin/rerun-cli` 并加执行权限，
+或者使用 `cargo binstall --force rerun-cli@0.33.1`。
 
 更换 VLA 或示教数据后，重新提取特征并训练配套 Stage 1：
 
