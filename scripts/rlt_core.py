@@ -103,6 +103,8 @@ class RerunVisualizationManager:
         self._condition = threading.Condition()
         self._observation: dict | None = None
         self._action: dict | None = None
+        self._debug_observation: dict | None = None
+        self._debug_action: dict | None = None
         self._running = False
         self._disabled = False
         self._thread: threading.Thread | None = None
@@ -115,6 +117,8 @@ class RerunVisualizationManager:
                 copied[key] = value.copy()
             elif isinstance(value, torch.Tensor):
                 copied[key] = value.detach().cpu().numpy().copy()
+            elif isinstance(value, (list, tuple)):
+                copied[key] = np.asarray(value).copy()
             elif isinstance(value, (int, float, np.integer, np.floating)):
                 copied[key] = value
         return copied
@@ -138,6 +142,26 @@ class RerunVisualizationManager:
             self._action = self._copy_values(action)
             self._condition.notify()
 
+    def publish_debug(self, *, observation: dict | None = None, action: dict | None = None) -> None:
+        """Queue lightweight diagnostic scalars and vectors for the live viewer."""
+        if self._disabled:
+            return
+        with self._condition:
+            if observation:
+                self._debug_observation = self._copy_values(observation)
+            if action:
+                self._debug_action = self._copy_values(action)
+            self._condition.notify()
+
+    @staticmethod
+    def _merge_values(primary: dict | None, debug: dict | None) -> dict | None:
+        if primary is None and debug is None:
+            return None
+        merged = {} if primary is None else dict(primary)
+        if debug:
+            merged.update(debug)
+        return merged
+
     def _run(self) -> None:
         next_log_time = 0.0
         while self._running:
@@ -150,8 +174,14 @@ class RerunVisualizationManager:
                 if wait_s > 0:
                     self._condition.wait(timeout=wait_s)
                     continue
-                observation, action = self._observation, self._action
-                self._observation, self._action = None, None
+                # Action receipts and their diagnostic comparison arrive from
+                # adjacent calls in the control loop. Give the producer a short
+                # coalescing window so one Rerun sample contains both.
+                self._condition.wait(timeout=0.002)
+                observation = self._merge_values(self._observation, self._debug_observation)
+                action = self._merge_values(self._action, self._debug_action)
+                self._observation = self._action = None
+                self._debug_observation = self._debug_action = None
             try:
                 self._log_data(
                     observation=observation,

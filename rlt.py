@@ -103,6 +103,12 @@ def main():
                                 help="Shared VLA/Actor/learner resampling grid (config: 100 Hz; commands: 30 Hz)")
             online.add_argument("--no-preview", action="store_true",
                                 help="Disable the live OpenCV camera window")
+            online.add_argument("--display-data", dest="display_data", action="store_true",
+                                help="Show live camera, action comparison and Actor/Critic metrics in Rerun")
+            online.add_argument("--display-compressed-images", dest="display_compressed_images",
+                                action="store_true", help="Compress camera frames sent to Rerun")
+            online.add_argument("--display-fps", dest="display_fps", type=float, default=None,
+                                help="Maximum Rerun update frequency")
             online.add_argument("--async-inference", "--async_inference",
                                 dest="async_inference", action=argparse.BooleanOptionalAction, default=None,
                                 help="Plan the next VLA chunk in a background thread instead of "

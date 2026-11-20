@@ -3929,6 +3929,22 @@ def main():
                     "n_done": float(n_done),
                 })
 
+                if visualization is not None:
+                    latest = metrics_window[-1]
+                    visualization.publish_debug(observation={
+                        "observation.rlt/updates/total": total_updates + 1,
+                        "observation.rlt/updates/critic": critic_updates,
+                        "observation.rlt/updates/actor": actor_updates,
+                        "observation.rlt/updates/aligned_critic": aligned_critic_updates,
+                        "observation.rlt/q1_mean": latest["q1_mean"],
+                        "observation.rlt/q2_mean": latest["q2_mean"],
+                        "observation.rlt/td_error": latest["td_err"],
+                        "observation.rlt/actor_q": latest["actorQ"] if math.isfinite(latest["actorQ"]) else None,
+                        "observation.rlt/reference_q": latest["referenceQ"] if math.isfinite(latest["referenceQ"]) else None,
+                        "observation.rlt/actor_advantage": latest["actorAdv"] if math.isfinite(latest["actorAdv"]) else None,
+                        "observation.rlt/bc_loss": latest["bc"] if math.isfinite(latest["bc"]) else None,
+                    })
+
                 total_updates += 1
                 return True
 
@@ -5425,6 +5441,25 @@ def main():
                     if actual_target is None:
                         SHUTDOWN = True
                         break
+                    if visualization is not None:
+                        vla_target = unnormalize_action(
+                            reference_command_rows[action_offset].to(device)
+                        ).detach().cpu()
+                        selected_target = requested_target.detach().cpu()
+                        accepted_target = actual_target.detach().cpu()
+                        visualization.publish_debug(action={
+                            "action.rlt/vla_target": vla_target,
+                            "action.rlt/selected_target": selected_target,
+                            "action.rlt/accepted_target": accepted_target,
+                            "action.rlt/selected_minus_vla": selected_target - vla_target,
+                            "action.rlt/accepted_minus_vla": accepted_target - vla_target,
+                            "action.rlt/accepted_minus_selected": accepted_target - selected_target,
+                            "action.rlt/source": 1 if action_source == "ACTOR" else 0,
+                            "action.rlt/critical": int(window_critical_active),
+                            "action.rlt/episode": episode,
+                            "action.rlt/episode_step": episode_step_counter,
+                            "action.rlt/actor_gate_advantage": latest_actor_advantage,
+                        })
                     if action_source == "ACTOR" and not actor_control_active:
                         actor_control_active = True
                         logger.info(

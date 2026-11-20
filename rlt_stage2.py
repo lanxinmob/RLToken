@@ -581,4 +581,10 @@ def run(args):
         command.extend(["--steps_per_episode", str(args.steps_per_episode)])
     if not args.dry_run and not getattr(args, "no_preview", False):
         command.append("--preview")
+    if getattr(args, "display_data", False):
+        command.append("--display_data")
+    if getattr(args, "display_compressed_images", False):
+        command.append("--display_compressed_images")
+    if getattr(args, "display_fps", None) is not None:
+        command.extend(["--display_fps", str(args.display_fps)])
     subprocess.run(command, cwd=ROOT, env=env, check=True)

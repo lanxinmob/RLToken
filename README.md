@@ -13,6 +13,19 @@ bash setup_arx.sh
 
 最后一条会连接配置中的执行臂和相机。启动前核对 CAN、标定与工作空间，停止占用同一机械臂的其他控制程序。Stage 2 使用 `.venv`，硬件进程使用配置中指定的 SDK Python。
 
+要在 Rerun 中查看相机、VLA 目标、Actor 选中目标和 SDK 实际接受的目标，可运行：
+
+```bash
+./rlt stage2 --auto-critical --episodes 200 --display-data \
+  --display-fps 10 --display-compressed-images
+```
+
+续训时追加 `--resume-from outputs/rlt/YOUR_RUN/final_checkpoint.pt`。
+动作差值包括 `selected-vla` 和 `accepted-selected`。`observation.rlt/*` 显示 Critic/Actor
+更新次数、Q 值、TD error、BC loss 和 Actor advantage。使用 `--display-fps` 调整刷新率，
+使用 `--display-compressed-images` 节省带宽。可用
+`../pi05/.tools/bin/uv pip install --python .venv/bin/python 'rerun-sdk>=0.24,<0.34'` 安装 Rerun SDK。
+
 更换 VLA 或示教数据后，重新提取特征并训练配套 Stage 1：
 
 ```bash
