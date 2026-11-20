@@ -82,6 +82,30 @@ def smooth_actions_torch(actions, taps: int, *, joints=None):
     return torch.cat([smoothed, actions[..., joints:]], dim=-1)
 
 
+def blend_policy_handoff(targets, handoff, previous_policy, *, actor, steps):
+    """Join the last accepted joint position and per-tick displacement to the new command path."""
+    import torch
+
+    n = min(steps, targets.shape[1])
+    if n < 2:
+        return targets
+    joints = targets[..., :-1]
+    start = handoff[:, 0:1, :-1].to(targets)
+    incoming = handoff[:, 1:2, :-1].to(targets)
+    end = joints[:, n - 1:n]
+    outgoing = joints[:, n:n + 1] - end if n < targets.shape[1] else end - joints[:, n - 2:n - 1]
+    # Cubic Hermite interpolation in command ticks. Keep the endpoint itself
+    # (and everything after it) exactly as planned.
+    u = torch.arange(1, n, device=targets.device, dtype=targets.dtype).view(1, -1, 1) / n
+    prefix = (1 - u).square() * ((1 + 2 * u) * start + u * n * incoming)
+    prefix = prefix + u.square() * ((3 - 2 * u) * end + (u - 1) * n * outgoing)
+    # Previous policy: -1 = no policy history, 0 = VLA, 1 = Actor.
+    enabled = previous_policy.reshape(-1, 1, 1) >= (0 if actor else 1)
+    prefix = torch.where(enabled, prefix, joints[:, :n - 1])
+    blended_joints = torch.cat([prefix, joints[:, n - 1:]], dim=1)
+    return torch.cat([blended_joints, targets[..., -1:]], dim=-1)
+
+
 class ActionTimeline:
     """Model waypoints -> command window, shared by rollout, BC and Q.
 
@@ -91,7 +115,8 @@ class ActionTimeline:
     smoothed plan identical to preparing an actor replacement of that slice.
     """
 
-    def __init__(self, model_steps, action_hz, grid_hz, tick_hz, smooth_taps=0, start_blend_steps=0):
+    def __init__(self, model_steps, action_hz, grid_hz, tick_hz, smooth_taps=0, start_blend_steps=0,
+                 actor_handoff_steps=0):
         if not all(np.isfinite(v) and v > 0 for v in (action_hz, grid_hz, tick_hz)):
             raise ValueError("Action, grid and command rates must be finite and positive")
         if grid_hz < action_hz:
@@ -101,6 +126,7 @@ class ActionTimeline:
         self.action_hz, self.grid_hz, self.tick_hz = map(float, (action_hz, grid_hz, tick_hz))
         self.smooth_taps = int(smooth_taps)
         self.start_blend_steps = int(start_blend_steps)
+        self.actor_handoff_steps = int(actor_handoff_steps)
         self.steps = int(np.floor((self.model_steps - 1) * self.grid_hz / self.action_hz + 1e-9)) + 1
         # One additional point is needed to interpolate a fractional final row.
         self.pad = self.smooth_taps // 2 + 1 if self.smooth_taps > 1 else 1
@@ -125,7 +151,7 @@ class ActionTimeline:
         ]).clamp(0, full_actions.shape[1] - 1)
         return full_actions.index_select(1, indices)
 
-    def metadata(self, full_actions, model_start, *, phase=0.0, step_id=0, blend_anchor=None):
+    def metadata(self, full_actions, model_start, *, phase=0.0, step_id=0, blend_anchor=None, handoff=None):
         import torch
 
         batch, _, dimension = full_actions.shape
@@ -143,7 +169,7 @@ class ActionTimeline:
             torch.arange(model_start + self.model_steps, model_start + self.model_steps + self.pad,
                          device=full_actions.device),
         ])
-        return {
+        metadata = {
             "context": self.context(full_actions, model_start),
             # A padded full-plan endpoint depends on the Actor only when the
             # replacement includes that endpoint. For a slice starting at 1,
@@ -157,8 +183,17 @@ class ActionTimeline:
             "blend_anchor": torch.as_tensor(blend_anchor, **options).reshape(batch, dimension),
             "blend_weights": weights,
         }
+        if self.actor_handoff_steps:
+            if handoff is None:
+                metadata["handoff"] = torch.zeros(batch, 2, dimension, **options)
+                metadata["previous_policy"] = torch.full((batch,), -1, **options)
+            else:
+                position, displacement, from_actor = handoff
+                metadata["handoff"] = torch.stack([position, displacement]).to(full_actions).expand(batch, -1, -1)
+                metadata["previous_policy"] = torch.full((batch,), int(from_actor), **options)
+        return metadata
 
-    def prepare(self, actions, metadata, *, execution_scale=1.0):
+    def prepare(self, actions, metadata, *, execution_scale=1.0, actor=False):
         """Differentiable normalized pre-SDK targets, including startup blending."""
         import torch
 
@@ -187,8 +222,12 @@ class ActionTimeline:
         weights = metadata["blend_weights"].to(actions).unsqueeze(-1)
         anchor = metadata["blend_anchor"].to(actions).unsqueeze(1)
         # Keep the gripper unblended, matching Stage 2 vla-only execution.
-        return torch.cat([anchor[..., :-1] + weights * (result[..., :-1] - anchor[..., :-1]),
-                          result[..., -1:]], dim=-1)
+        result = torch.cat([anchor[..., :-1] + weights * (result[..., :-1] - anchor[..., :-1]),
+                            result[..., -1:]], dim=-1)
+        if self.actor_handoff_steps and "handoff" in metadata:
+            result = blend_policy_handoff(result, metadata["handoff"], metadata["previous_policy"],
+                                          actor=actor, steps=self.actor_handoff_steps)
+        return result
 
 
 class AcceptedActionTransform:
@@ -213,14 +252,15 @@ class AcceptedActionTransform:
         self.upper = torch.as_tensor(profile["upper"], dtype=torch.float32, device=device)
         self.alpha = float(profile["alpha"])
 
-    def __call__(self, requested, execution_state, valid_mask=None, *, preparation=None, execution_scale=None):
+    def __call__(self, requested, execution_state, valid_mask=None, *, preparation=None, execution_scale=None,
+                 actor=True):
         import torch
 
         if execution_state.shape != (requested.shape[0], 2, requested.shape[-1]):
             raise ValueError("Execution state must contain previous and filtered physical targets")
         scale = self.execution_scale if execution_scale is None else float(execution_scale)
         if self.timeline is not None:
-            requested = self.timeline.prepare(requested, preparation, execution_scale=scale)
+            requested = self.timeline.prepare(requested, preparation, execution_scale=scale, actor=actor)
         else:
             requested = smooth_actions_torch(requested, self.smooth_taps) * scale
         previous, filtered = execution_state[:, 0], execution_state[:, 1]
