@@ -211,15 +211,7 @@ def _build_mlp(input_dim: int, hidden_dim: int, num_layers: int, output_dim: int
 
 
 class RLTChunkActor(nn.Module):
-    """Paper full-output Gaussian chunk actor: (z_rl, proprio, ref_chunk) -> action mean.
-
-    Lightweight MLP matching the RL-Token-Pi05 Stage-2 trained architecture
-    (``actor_contract = paper_full_output_v1``): concatenate ``z_rl``,
-    proprioception and the flattened reference chunk, then
-    ``[Linear, ReLU] * (num_layers - 1) + Linear(chunk * action_dim)``.
-    Returns a Gaussian with fixed std. Always full output — no residual mode
-    (``is_residual`` stays False, per the paper contract).
-    """
+    """Fixed-std chunk actor with a full-output or bounded VLA-residual mean."""
 
     def __init__(
         self,
@@ -250,11 +242,15 @@ class RLTChunkActor(nn.Module):
         self.action_dim = action_dim
         self.chunk = chunk
         self.fixed_std = float(getattr(config, "policy_fixed_std", 0.05))
-        self.is_residual = False  # paper contract: full output, never residual
+        self._residual_scale = float(getattr(config, "actor_residual_scale", 0.0))
+        self.is_residual = self._residual_scale > 0
 
         input_dim = z_dim + state_dim + chunk * action_dim
         output_dim = chunk * action_dim
         self.net = _build_mlp(input_dim, self.hidden_dim, self.num_layers, output_dim)
+        if self.is_residual:
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
 
     def _flatten_chunk(self, chunk: Tensor, batch: int) -> Tensor:
         """Flatten a (B, chunk, action_dim) / (B, chunk*action_dim) / (chunk, action_dim)
@@ -290,14 +286,21 @@ class RLTChunkActor(nn.Module):
         proprio: Tensor,
         ref_chunk: Tensor,
         training: bool = False,
+        reference_dropout: float = 0.0,
     ) -> tuple[Tensor, Tensor]:
         if z_rl.ndim == 1:
             z_rl = z_rl.unsqueeze(0)
         if proprio.ndim == 1:
             proprio = proprio.unsqueeze(0)
         ref_flat = self._flatten_chunk(ref_chunk, z_rl.shape[0])
-        x = torch.cat([z_rl, proprio, ref_flat], dim=-1)
+        conditioned_ref = ref_flat
+        if training and reference_dropout > 0:
+            drop = torch.rand((ref_flat.shape[0], 1), device=ref_flat.device) < reference_dropout
+            conditioned_ref = ref_flat.masked_fill(drop, 0.0)
+        x = torch.cat([z_rl, proprio, conditioned_ref], dim=-1)
         mean_flat = self.net(x)
+        if self.is_residual:
+            mean_flat = ref_flat + self._residual_scale * mean_flat.tanh()
         mean = mean_flat.reshape(-1, self.chunk, self.action_dim)
         std = torch.full_like(mean, self.fixed_std)
         return mean, std

@@ -9,17 +9,11 @@ configuration of the RL-Token-Pi05 pipeline on SO-101:
 - ``state_dim = action_dim = 6`` (5 joints + gripper)
 - RL chunk = ``n_action_steps_rl = 10`` contiguous steps;
   ``action_stride = 2`` selects overlapping replay window starts
-- paper full-output MLP actor/critic with fixed std ``policy_fixed_std``
-  (no residual mode)
-
-.. note::
-   The earlier reference-projection actor/critic fields (``actor_hidden_dims``
-   list, ``ref_dropout``, ``actor_residual_scale``) were removed: the paper
-   pipeline always trains the full-output MLP heads and the SmolVLA-oriented
-   variant is not maintained anymore.
+- Gaussian MLP actor with fixed std and optional bounded corrections to the VLA
 """
 
 from dataclasses import dataclass, field
+import math
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
@@ -75,11 +69,8 @@ class PI05RLTConfig(PreTrainedConfig):
     # order. Declared so export_rlt_pretrained can persist it into config.json
     # and rollout boundaries can validate/reorder before touching hardware.
     action_feature_names: list[str] | None = None
-    # Export-contract fields (written by scripts/export_rlt_pretrained.py).
-    # The local modeling is hard-wired to the paper contract (full-output MLP
-    # actor, no residual head), so these are descriptive round-trip fields:
-    # they must exist so a saved config.json loads back via from_pretrained.
     actor_critic_style: str = "paper_mlp"
+    # Positive values bound each mean correction in normalized action units.
     actor_residual_scale: float = 0.0
 
     # ── RL hyperparameters used by the policy helpers (Stage 2) ──────────
@@ -155,6 +146,8 @@ class PI05RLTConfig(PreTrainedConfig):
             raise ValueError("actor_hidden_dim and critic_hidden_dim must be positive")
         if self.policy_fixed_std <= 0:
             raise ValueError("policy_fixed_std must be positive")
+        if not math.isfinite(self.actor_residual_scale) or self.actor_residual_scale < 0:
+            raise ValueError("actor_residual_scale must be finite and non-negative")
         if self.deploy_auto_critical:
             if not self.critical_classifier_path:
                 raise ValueError(
