@@ -431,6 +431,7 @@ class DeferredBoundarySnapshot:
     raw_action_index: int = 0
     grid_phase: float = 0.0
     handoff: tuple[torch.Tensor, torch.Tensor, bool] | None = None
+    policy_start: tuple[int, torch.Tensor] | None = None
 
 
 @dataclass
@@ -1381,7 +1382,7 @@ class ReplayBuffer:
 def migrate_replay_timing(transition: Transition, timeline: ActionTimeline) -> Transition:
     """Preserve old demonstrations for BC; never invent an RL execution trace."""
     if (transition.execution_timing is not None
-            and np.array_equal(transition.execution_timing, timeline.signature)
+            and timeline.compatible_timing(transition.execution_timing)
             and len(transition.action_chunk) == timeline.steps
             and transition.preparation is not None and transition.next_preparation is not None):
         return transition
@@ -2204,8 +2205,8 @@ def parse_args():
     parser.add_argument("--max_relative_target", type=str, default=None,
                         help="Optional positive degree scalar or JSON per-joint motor limits; omitted disables clipping")
     parser.add_argument("--start_blend_steps", type=int, default=0,
-                        help="Ease from the measured pose into the plan over N control steps at "
-                             "episode start; keeps the first chunk from jumping to the model target")
+                        help="Ease the joints from the current pose over N policy commands at episode start "
+                             "and after HIL release (0 or 1 disables blending)")
     parser.add_argument("--actor_handoff_steps", type=int, default=0,
                         help="Join policy chunks involving the Actor over N command ticks (0 disables)")
     parser.add_argument("--exec_grid_hz", type=float, default=None,
@@ -2838,7 +2839,9 @@ def main():
         args.chunk_smooth_taps, args.start_blend_steps, args.actor_handoff_steps,
     )
     command_horizon = timeline.steps
-    timing_changed = resume_checkpoint is not None and resume_checkpoint.get("execution_timing") != timeline.profile()
+    timing_changed = resume_checkpoint is not None and not timeline.compatible_timing(
+        resume_checkpoint.get("execution_timing")
+    )
     logger.info(
         "Shared execution timeline: model=%.1f Hz | grid=%.1f Hz | commands=%.1f Hz | "
         "%d model actions -> %d commands (%.3fs); FIR=%d, startup blend=%d, Actor handoff=%d commands",
@@ -3704,7 +3707,7 @@ def main():
         )
         resume_advantage = (
             float(resume_checkpoint["actor_gate_advantage"])
-            if resume_checkpoint is not None and not timing_changed
+            if resume_checkpoint is not None and resume_checkpoint.get("execution_timing") == timeline.profile()
             and resume_checkpoint.get("actor_handoff_steps", 0) == timeline.actor_handoff_steps
             and resume_checkpoint.get("actor_gate_policy") == "mean"
             and resume_checkpoint.get("actor_gate_advantage") is not None
@@ -4431,8 +4434,31 @@ def main():
             stride_mt_lock = threading.Lock()
             stride_mt_thread: threading.Thread | None = None
             stride_mt_error: Exception | None = None
-            startup_blend_anchor: torch.Tensor | None = None
+            policy_start: tuple[int, torch.Tensor] | None = None
             policy_handoff = None
+
+            def begin_policy_segment():
+                nonlocal last_valid_target, policy_handoff, policy_start, next_policy_tick
+                if hardware is not None:
+                    hardware.set_phase("policy")
+                obs = read_follower_observation("policy entry")
+                if obs is None:
+                    return False
+                controller = execution_state_from_observation(obs)
+                pose = torch.from_numpy(controller[0]) if controller is not None else obs_to_state_tensor(obs)
+                # Async planning can send HOLD before the first policy window exists.
+                last_valid_target = tensor_to_robot_action(pose, "policy entry")
+                policy_start = (episode_step_counter, normalize_action(pose))
+                policy_handoff = None
+                next_policy_tick = None
+                return True
+
+            def plan_metadata(actions, model_start, phase, step_id, start, handoff):
+                elapsed = timeline.start_blend_steps if start is None else step_id - start[0]
+                return timeline.metadata(
+                    actions[..., :rlt_config.action_dim], model_start, phase=phase, step_id=elapsed,
+                    blend_anchor=None if start is None else start[1], handoff=handoff,
+                )
 
             def capture_boundary_snapshot(context: str, step_id: int) -> DeferredBoundarySnapshot | None:
                 obs = read_follower_observation(context)
@@ -4444,7 +4470,7 @@ def main():
                     logger.error("Invalid follower observation at %s: %s", context, exc)
                     return None
                 return DeferredBoundarySnapshot(clone_observation(obs), state.detach().clone(), step_id,
-                                                handoff=policy_handoff)
+                                                handoff=policy_handoff, policy_start=policy_start)
 
             def await_pi05_plan(step_id: int) -> PrefetchedPi05Plan | None:
                 """Wait without blocking takeover, feedback, preview or hold commands."""
@@ -4496,6 +4522,7 @@ def main():
                 raw_action_index: int = 0,
                 grid_phase: float = 0.0,
                 handoff: tuple[torch.Tensor, torch.Tensor, bool] | None = None,
+                policy_start: tuple[int, torch.Tensor] | None = None,
             ) -> BoundaryContext:
                 # When raw_actions are cached (stride-2 / HIL snapshot
                 # materialization), skip the action diffusion and only recompute
@@ -4514,13 +4541,7 @@ def main():
                     start_index=raw_action_index,
                     num_steps=rlt_config.n_action_steps_rl,
                 )
-                preparation = timeline.metadata(
-                    raw_actions[:, :, :rlt_config.action_dim], raw_action_index,
-                    phase=grid_phase, step_id=step_id,
-                    handoff=handoff,
-                    blend_anchor=(normalize_action(state.detach().cpu()).to(raw_actions)
-                                  if startup_blend_anchor is None else startup_blend_anchor.to(raw_actions)),
-                )
+                preparation = plan_metadata(raw_actions, raw_action_index, grid_phase, step_id, policy_start, handoff)
                 return BoundaryContext(
                     z_rl=z_rl.detach(),
                     proprio=normalize_state(state)[:rlt_config.state_dim].detach(),
@@ -4548,6 +4569,7 @@ def main():
                     raw_action_index=snapshot.raw_action_index,
                     grid_phase=snapshot.grid_phase,
                     handoff=snapshot.handoff,
+                    policy_start=snapshot.policy_start,
                 )
 
             def start_stride_materialization() -> None:
@@ -4810,8 +4832,8 @@ def main():
                             "Positioning finished; starting the VLA episode from the positioned pose."
                         )
 
-            if hardware is not None:
-                hardware.set_phase("policy")
+            if not begin_policy_segment():
+                break
 
             steps_per_block = command_horizon
             max_rollout_blocks = math.ceil(args.steps_per_episode / steps_per_block)
@@ -4903,6 +4925,7 @@ def main():
                             print("[KEY] Actor takeover STOPPED; human HIL active", flush=True)
                         human_active = True
                         policy_handoff = None
+                        policy_start = None
                         human_boundary = snapshot
                         teleop.enter_human_mode(args.leader_hil_min_dwell_s)
                         action_cache.clear()
@@ -4923,37 +4946,24 @@ def main():
                 if human_active and (teleop.consume_resume_request() or force_resume):
                     if hardware is not None:
                         hardware.set_phase("idle")
-                    # Wait for materialization to complete before resuming
-                    if flush_deferred_hil_windows(wait=True):
-                        human_active = False
-                        human_motion_started = False
-                        human_motion_anchor = None
-                        human_boundary = None
-                        teleop.exit_human_mode()
-                        action_cache.clear()
-                        if planner is not None:
-                            planner.invalidate()
-                        # Interventions are corrections: exit HIL and continue the
-                        # episode. The terminal reward is judged at the normal
-                        # episode-end prompt (y/n/d/q), not at HIL exit.
-                        logger.info("HIL exited; policy replans and resumes (episode continues).")
-                        print("[KEY] HIL exited; policy resumed (episode continues)", flush=True)
-                    else:
-                        # Even if materialization failed, force resume policy
-                        human_active = False
-                        human_motion_started = False
-                        human_motion_anchor = None
-                        human_boundary = None
-                        teleop.exit_human_mode()
-                        action_cache.clear()
-                        if planner is not None:
-                            planner.invalidate()
+                    if human_motion_started and human_boundary is not None:
+                        # The last human window bootstraps from a fresh policy start at its end observation.
+                        human_boundary.policy_start = (human_boundary.step_id, normalize_action(human_boundary.state))
+                    if not flush_deferred_hil_windows(wait=True):
                         deferred_windows.clear()
                         logger.warning("HIL materialization failed; forcing policy resume.")
-                        print("[KEY] HIL exited; policy resumed (episode continues)", flush=True)
-
-                    if hardware is not None:
-                        hardware.set_phase("policy")
+                    human_active = False
+                    human_motion_started = False
+                    human_motion_anchor = None
+                    human_boundary = None
+                    teleop.exit_human_mode()
+                    action_cache.clear()
+                    if planner is not None:
+                        planner.invalidate()
+                    if not begin_policy_segment():
+                        break
+                    logger.info("HIL exited; policy replans and resumes (episode continues).")
+                    print("[KEY] HIL exited; policy resumed (episode continues)", flush=True)
 
                 if hil_terminal_requested:
                     break
@@ -5362,15 +5372,8 @@ def main():
                 )
                 grid_start = min(grid_start, max(0, full_grid_length - command_horizon))
                 grid_phase = grid_start * timeline.action_hz / timeline.grid_hz - full_plan_start
-                if episode_step_counter == 0:
-                    startup_blend_anchor = normalize_action(state_tensor).detach().cpu().clone()
-                preparation = timeline.metadata(
-                    full_plan_actions[:, :, :rlt_config.action_dim], full_plan_start,
-                    phase=grid_phase, step_id=episode_step_counter,
-                    handoff=policy_handoff,
-                    blend_anchor=(normalize_action(state_tensor) if startup_blend_anchor is None
-                                  else startup_blend_anchor.to(ref_actions)),
-                )
+                preparation = plan_metadata(full_plan_actions, full_plan_start, grid_phase, episode_step_counter,
+                                            policy_start, policy_handoff)
                 boundary = BoundaryContext(
                     z_rl=z_rl.detach(),
                     proprio=normalize_state(state_tensor)[:rlt_config.state_dim].detach(),

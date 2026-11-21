@@ -145,6 +145,15 @@ class ActionTimeline:
             self.signature.tolist(),
         ))
 
+    def compatible_timing(self, timing):
+        # Each replay window already carries its own startup anchor and weights.
+        if isinstance(timing, dict):
+            profile = self.profile()
+            if timing.keys() != profile.keys():
+                return False
+            timing = [timing[key] for key in profile]
+        return np.shape(timing) == self.signature.shape and np.array_equal(timing[:-1], self.signature[:-1])
+
     def context(self, full_actions, model_start):
         import torch
 
@@ -161,8 +170,9 @@ class ActionTimeline:
         batch, _, dimension = full_actions.shape
         options = {"dtype": full_actions.dtype, "device": full_actions.device}
         weights = torch.ones(batch, self.steps, **options)
-        if self.start_blend_steps:
-            weights = ((torch.arange(self.steps, **options) + step_id + 1) / self.start_blend_steps).clamp(max=1)
+        if self.start_blend_steps > 1:
+            u = ((torch.arange(self.steps, **options) + step_id) / (self.start_blend_steps - 1)).clamp(0, 1)
+            weights = u.square() * (3 - 2 * u)
             weights = weights.unsqueeze(0).expand(batch, -1)
         if blend_anchor is None:
             if (weights < 1).any():
