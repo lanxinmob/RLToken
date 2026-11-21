@@ -268,7 +268,7 @@ class DualArmWorker:
             import cv2
 
             cv2.namedWindow("RLT ARX5 | cam_wrist", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("RLT ARX5 | cam_wrist", 768, 768)
+            cv2.resizeWindow("RLT ARX5 | cam_wrist", 640, 640)
             self._cv2 = cv2
             self._preview_enabled = True
             print("ARX live preview enabled: RLT ARX5 | cam_wrist (q/Esc closes the window)", flush=True)
