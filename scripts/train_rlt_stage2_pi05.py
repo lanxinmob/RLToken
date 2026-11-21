@@ -828,6 +828,7 @@ def build_transition(
         z_rl=window.boundary.z_rl.detach().cpu().numpy().squeeze(),
         proprio=window.boundary.proprio.detach().cpu().numpy(),
         ref_chunk=refs.numpy(),
+        vla_ref_chunk=window.boundary.ref_chunk.detach().cpu().reshape_as(refs).float().numpy(),
         action_chunk=actions.numpy(),
         requested_chunk=requested.numpy(),
         rewards=rewards,
@@ -1193,12 +1194,14 @@ def clamp_actor_action(action: torch.Tensor, limit: float) -> torch.Tensor:
     return action.clamp(min=-limit, max=limit)
 
 
+def actor_reference(actor, batch):
+    # Older journals only have the possibly human-corrected reference.
+    return batch.get("vla_ref_chunk", batch["ref_chunk"]) if actor.is_residual else batch["ref_chunk"]
+
+
 def sample_training_proposal(actor, batch, reference_dropout, actor_action_limit: float = 1.0):
-    ref = batch["ref_chunk"]
-    if reference_dropout > 0:
-        drop = torch.rand(ref.shape[0], device=ref.device) < reference_dropout
-        ref = ref.masked_fill(drop[:, None, None], 0.0)
-    mean, std = actor(batch["z_rl"], batch["proprio"], ref, training=True)
+    mean, std = actor(batch["z_rl"], batch["proprio"], actor_reference(actor, batch),
+                      training=True, reference_dropout=reference_dropout)
     mean = clamp_actor_action(mean, actor_action_limit)
     sampled = clamp_actor_action(sample_fixed_std_action(mean, std), actor_action_limit)
     return mean, sampled
@@ -1502,6 +1505,7 @@ class ReplayManager:
                         z_rl=record["z_rl"].astype(np.float32),
                         proprio=record["proprio"].astype(np.float32),
                         ref_chunk=record["ref_chunk"].astype(np.float32),
+                        vla_ref_chunk=record.get("vla_ref_chunk"),
                         action_chunk=record["action_chunk"].astype(np.float32),
                         requested_chunk=record.get("requested_chunk", record["action_chunk"]).astype(np.float32),
                         rewards=record["rewards"].astype(np.float32),
@@ -1982,7 +1986,7 @@ def build_stage2_checkpoint(**payload) -> dict:
     return {
         "schema_version": 4 if payload.get("execution_timing") is not None else 3,
         "resume_supported": True,
-        "actor_contract": "paper_full_output_v1",
+        "actor_contract": actor_contract_for_scale(payload.get("runtime_provenance", {}).get("actor_residual_scale", 0.0)),
         "rl_chunk_length": 10,
         **payload,
     }
@@ -2075,14 +2079,14 @@ def prepare_resume_checkpoint(path: Path, output_dir: Path, *, dry_run: bool) ->
     if (
         checkpoint.get("schema_version") not in (3, 4)
         or not checkpoint.get("resume_supported")
-        or checkpoint.get("actor_contract") != "paper_full_output_v1"
         or checkpoint.get("rl_chunk_length") != 10
         or missing
     ):
         raise ValueError(
-            "Checkpoint is not a complete paper-aligned full-output Stage 2 checkpoint; start a new run. "
+            "Checkpoint is not a complete Stage 2 training checkpoint. "
             f"Missing: {missing}"
         )
+    checkpoint_actor_scale(checkpoint)
     source_journal = path.parent / "replay_journal.pkl"
     if not source_journal.is_file():
         raise FileNotFoundError(f"Resume checkpoint requires replay journal: {source_journal}")
@@ -2312,7 +2316,7 @@ def parse_args():
     parser.add_argument("--control_fps", type=float, default=10.0)
     parser.add_argument("--output_dir", type=str, default="checkpoints/rlt_stage2_pi05")
     parser.add_argument("--resume_from", type=str, default=None,
-                        help="Complete full-output Stage 2 checkpoint to resume into a new output directory")
+                        help="Complete Stage 2 checkpoint to resume into a new output directory")
     parser.add_argument("--restore_replay", type=str, default=None,
                         help="Path to an existing replay_journal.pkl to restore into a NEW run "
                              "(fresh actor/critic weights, kept transitions; useful for retraining "
@@ -2351,7 +2355,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--actor_lr", type=float, default=3e-4)
     parser.add_argument("--actor_residual_scale", type=float, default=0.0,
-                        help="Deprecated compatibility flag; paper-aligned Stage 2 requires 0.0.")
+                        help="Maximum normalized mean correction per dimension for a new Actor (0 = full output)")
     parser.add_argument("--critic_lr", type=float, default=3e-4)
     parser.add_argument("--utd_ratio", type=int, default=5)
     parser.add_argument("--critic_per_actor", type=int, default=2)
@@ -2514,8 +2518,7 @@ def main():
     if args.exec_grid_hz is not None:
         if args.exec_grid_hz <= 0 or not math.isfinite(args.exec_grid_hz):
             raise ValueError("--exec_grid_hz must be finite and positive.")
-    if args.actor_residual_scale != 0:
-        raise ValueError("Paper-aligned RLT uses a full-output Actor; --actor_residual_scale must be 0.")
+    actor_contract_for_scale(args.actor_residual_scale)
     if args.actor_action_limit <= 0 or not math.isfinite(args.actor_action_limit):
         raise ValueError("--actor_action_limit must be finite and positive.")
     if args.intervention_reward_bonus != 0:
@@ -2616,6 +2619,8 @@ def main():
         resume_checkpoint = prepare_resume_checkpoint(
             resume_source, output_dir, dry_run=(args.dry_run or args.inference_only),
         )
+        args.actor_residual_scale = checkpoint_actor_scale(resume_checkpoint)
+        args.policy_fixed_std = resume_checkpoint.get("policy_fixed_std", args.policy_fixed_std)
 
     # ── Logging split: detailed logs go to <output_dir>/train.log (tail it in a
     # second terminal); the console stays clean (warnings/errors + explicit
@@ -2697,6 +2702,7 @@ def main():
     rlt_config = PI05RLTConfig(
         device=str(device),
         mode="online_rl",
+        actor_residual_scale=args.actor_residual_scale,
         discount=args.discount,
         bc_weight=args.online_bc_weight,
         target_tau=args.target_tau,
@@ -2891,7 +2897,8 @@ def main():
         num_layers=args.actor_num_layers,
     ).to(device)
     actor.fixed_std = args.policy_fixed_std
-    logger.info("Actor mode: full-output MLP conditioned on the reference chunk, with BC regularization")
+    logger.info("Actor contract: %s | residual scale: %g",
+                actor_contract_for_scale(args.actor_residual_scale), args.actor_residual_scale)
     actor_target = copy.deepcopy(actor).to(device)
     for p in actor_target.parameters():
         p.requires_grad = False
@@ -2977,7 +2984,7 @@ def main():
             critic_optimizer.load_state_dict(resume_checkpoint["critic_optimizer"])
         move_optimizer_state_to_device(actor_optimizer, device)
         move_optimizer_state_to_device(critic_optimizer, device)
-        logger.info("Loaded full-output Stage 2 checkpoint from %s", args.resume_from)
+        logger.info("Loaded Stage 2 checkpoint from %s", args.resume_from)
 
     actor_params = sum(p.numel() for p in actor.parameters())
     critic_params = sum(p.numel() for p in critic.parameters())
@@ -3622,6 +3629,7 @@ def main():
                     critic_target_state_dict=critic_target.state_dict(),
                     actor_optimizer=actor_optimizer.state_dict(),
                     critic_optimizer=critic_optimizer.state_dict(),
+                    policy_fixed_std=actor.fixed_std,
                     episode_rewards=episode_rewards,
                     episode_interventions=episode_interventions,
                     total_updates=total_updates,
@@ -3957,7 +3965,7 @@ def main():
                         ).mean()
                         reference_q = critic.q_min(
                             batch["z_rl"].detach(), critic_proprio(batch),
-                            critic_action(batch, batch["ref_chunk"], reference=True),
+                            critic_action(batch, actor_reference(actor, batch), reference=True),
                         ).mean()
                     actor_advantage = actor_q - reference_q
                     latest_actor_advantage = float(actor_advantage.detach())

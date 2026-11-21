@@ -736,12 +736,13 @@ def load_actor_checkpoint(path: Path) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     required = {"actor_state_dict", "actor_contract", "rl_chunk_length", "episode"}
     missing = sorted(required - set(checkpoint))
-    if missing or checkpoint.get("actor_contract") != "paper_full_output_v1" or checkpoint.get("rl_chunk_length") != 10:
+    if missing or checkpoint.get("rl_chunk_length") != 10:
         raise ValueError(
-            "Checkpoint is not a paper-aligned full-output Stage 2 actor checkpoint "
+            "Invalid Stage 2 actor checkpoint "
             f"(missing={missing}, actor_contract={checkpoint.get('actor_contract')}, "
             f"rl_chunk_length={checkpoint.get('rl_chunk_length')})."
         )
+    checkpoint_actor_scale(checkpoint)
     return checkpoint
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1234,7 +1235,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--actor_lr", type=float, default=3e-4)
     parser.add_argument("--actor_residual_scale", type=float, default=0.0,
-                        help="Deprecated compatibility flag; paper-aligned Stage 2 requires 0.0.")
+                        help="Normalized residual bound (the loaded checkpoint supplies its own value)")
     parser.add_argument("--critic_lr", type=float, default=3e-4)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--online_bc_weight", type=float, default=10.0,
@@ -1362,8 +1363,7 @@ def main():
         raise ValueError("--rtc_execution_horizon must be non-negative (0 = disable RTC).")
     if args.rtc_max_guidance_weight <= 0 or not math.isfinite(args.rtc_max_guidance_weight):
         raise ValueError("--rtc_max_guidance_weight must be finite and positive.")
-    if args.actor_residual_scale != 0:
-        raise ValueError("Paper-aligned RLT uses a full-output Actor; --actor_residual_scale must be 0.")
+    actor_contract_for_scale(args.actor_residual_scale)
     if args.intervention_reward_bonus != 0:
         raise ValueError(
             "Paper-aligned RLT uses terminal-only binary rewards; --intervention_reward_bonus must be 0."
@@ -1443,6 +1443,8 @@ def main():
     prepare_output_dir(output_dir, dry_run=args.dry_run)
     if resume_source is not None:
         resume_checkpoint = load_actor_checkpoint(resume_source)
+        args.actor_residual_scale = checkpoint_actor_scale(resume_checkpoint)
+        args.policy_fixed_std = resume_checkpoint.get("policy_fixed_std", args.policy_fixed_std)
 
     # ── Logging split: detailed logs go to <output_dir>/train.log (tail it in a
     # second terminal); the console stays clean (warnings/errors + explicit
@@ -1520,6 +1522,7 @@ def main():
 
     rlt_config = PI05RLTConfig(
         mode="online_rl",
+        actor_residual_scale=args.actor_residual_scale,
         discount=args.discount,
         bc_weight=args.online_bc_weight,
         target_tau=args.target_tau,
@@ -1652,7 +1655,8 @@ def main():
         num_layers=args.actor_num_layers,
     ).to(device)
     actor.fixed_std = args.policy_fixed_std
-    logger.info("Actor mode: paper full-output with reference pass-through and BC regularization")
+    logger.info("Actor contract: %s | residual scale: %g",
+                actor_contract_for_scale(args.actor_residual_scale), args.actor_residual_scale)
     if resume_checkpoint is not None:
         actor.load_state_dict(resume_checkpoint["actor_state_dict"], strict=True)
         logger.info("Loaded trained Stage 2 actor from %s", args.resume_from)

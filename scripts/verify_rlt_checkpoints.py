@@ -3,8 +3,8 @@
 ``pi05_rlt`` policy package (single source of truth) with strict=True.
 
 This is the compatibility gate for the "lerobot-native pipeline" refactor:
-Stage-1 encoder/decoder checkpoints and Stage-2 (schema v3/v4,
-``paper_full_output_v1``) actor/critic checkpoints must be loadable by
+Stage-1 encoder/decoder checkpoints and Stage-2 (schema v3/v4)
+actor/critic checkpoints must be loadable by
 ``lerobot.policies.pi05_rlt`` modules without any key/shape conversion.
 
 Usage:
@@ -31,6 +31,7 @@ if str(LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LEROBOT_SRC))
 
 from lerobot.policies.pi05_rlt.configuration_pi05_rlt import PI05RLTConfig
+from rlt_core import checkpoint_actor_scale
 from lerobot.policies.pi05_rlt.modeling_pi05_rlt import (
     RLTokenDecoder,
     RLTokenEncoder,
@@ -80,18 +81,23 @@ def verify_stage1(path: Path, device: str) -> None:
 
 def verify_stage2(path: Path, device: str) -> None:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if ckpt.get("schema_version") not in (3, 4) or ckpt.get("actor_contract") != "paper_full_output_v1":
-        raise SystemExit(f"Not a schema-v3/v4 paper_full_output_v1 Stage-2 checkpoint: {path}")
+    if ckpt.get("schema_version") not in (3, 4):
+        raise SystemExit(f"Unsupported Stage-2 checkpoint schema: {path}")
     # Stage-2 ckpts do not store the full config; infer from state-dict shapes.
     asd = ckpt["actor_state_dict"]
     z_state_ref_in = asd["net.0.weight"].shape[1]
+    chunk = ckpt["rl_chunk_length"]
+    output_layer = max(int(key.split(".")[1]) for key in asd if key.endswith(".weight"))
+    action_dim = asd[f"net.{output_layer}.weight"].shape[0] // chunk
     cfg = PI05RLTConfig(
         mode="online_rl",
-        state_dim=6,
-        action_dim=6,
+        state_dim=action_dim,
+        action_dim=action_dim,
         action_stride=2,
-        n_action_steps_rl=ckpt["rl_chunk_length"],
-        rlt_hidden_dim=z_state_ref_in - 6 - ckpt["rl_chunk_length"] * 6,
+        n_action_steps_rl=chunk,
+        rlt_hidden_dim=z_state_ref_in - action_dim - chunk * action_dim,
+        actor_residual_scale=checkpoint_actor_scale(ckpt),
+        policy_fixed_std=ckpt.get("policy_fixed_std", 0.05),
         actor_hidden_dim=asd["net.0.weight"].shape[0],
         actor_num_layers=len({k.split(".")[1] for k in asd if k.startswith("net.")}),
         critic_hidden_dim=ckpt["critic_state_dict"]["q1.0.weight"].shape[0],
@@ -100,7 +106,9 @@ def verify_stage2(path: Path, device: str) -> None:
     )
     actor = RLTChunkActor(cfg).to(device).eval()
     actor.load_state_dict(ckpt["actor_state_dict"], strict=True)
-    critic = RLTTwinCritic(cfg).to(device).eval()
+    critic_state_dim = ckpt.get("critic_proprio_dim") or cfg.state_dim
+    critic_steps = ckpt.get("critic_action_steps") or chunk
+    critic = RLTTwinCritic(cfg, proprio_dim=critic_state_dim, action_steps=critic_steps).to(device).eval()
     critic.load_state_dict(ckpt["critic_state_dict"], strict=True)
     B = 2
     z = torch.randn(B, cfg.rlt_hidden_dim, device=device)
@@ -108,7 +116,10 @@ def verify_stage2(path: Path, device: str) -> None:
     ref = torch.randn(B, cfg.n_action_steps_rl, cfg.action_dim, device=device)
     with torch.no_grad():
         mean, std = actor(z, state, ref)
-        q1, q2 = critic(z, state, ref)
+        q1, q2 = critic(z, torch.randn(B, critic_state_dim, device=device),
+                        torch.randn(B, critic_steps, cfg.action_dim, device=device))
+    if actor.is_residual:
+        assert (mean - ref).abs().max() <= cfg.actor_residual_scale + 1e-6
     assert tuple(mean.shape) == (B, cfg.n_action_steps_rl, cfg.action_dim)
     assert torch.allclose(std, torch.full_like(std, cfg.policy_fixed_std))
     assert tuple(q1.shape) == (B, 1) and tuple(q2.shape) == (B, 1)

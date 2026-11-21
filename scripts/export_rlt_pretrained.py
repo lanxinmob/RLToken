@@ -74,7 +74,7 @@ def build_export_config_kwargs(stage1_ckpt: dict, stage2_ckpt: dict, device: str
     provenance = stage2_ckpt.get("runtime_provenance", {})
     if not isinstance(provenance, dict):
         provenance = {}
-    from rlt_core import SO101_JOINT_NAMES
+    from rlt_core import SO101_JOINT_NAMES, checkpoint_actor_scale
 
     kwargs = {"mode": "online_rl", "device": device}
     for field in _CONFIG_FIELDS - {"mode", "device"}:
@@ -99,8 +99,9 @@ def build_export_config_kwargs(stage1_ckpt: dict, stage2_ckpt: dict, device: str
         "n_action_steps_rl": chunk_length,
         "action_stride": stride,
         "actor_critic_style": "paper_mlp",
-        "actor_residual_scale": 0.0,
-        "policy_fixed_std": float(provenance.get("policy_fixed_std", kwargs.get("policy_fixed_std", 0.05))),
+        "actor_residual_scale": checkpoint_actor_scale(stage2_ckpt),
+        "policy_fixed_std": float(stage2_ckpt.get("policy_fixed_std",
+                                                 provenance.get("policy_fixed_std", kwargs.get("policy_fixed_std", 0.05)))),
         # Native LeRobot rollout reads this field to align state and action keys.
         "action_feature_names": [f"{name}.pos" for name in SO101_JOINT_NAMES],
     })
@@ -177,7 +178,7 @@ def main() -> None:
     ap.add_argument("--stage1-checkpoint", type=Path, required=True,
                     help="Stage-1 .pt (encoder/decoder), paper_v1 image-only")
     ap.add_argument("--stage2-checkpoint", type=Path, required=True,
-                    help="Stage-2 .pt (schema v3/v4, paper_full_output_v1)")
+                    help="Stage-2 Actor/Critic checkpoint (schema v3/v4)")
     ap.add_argument("--pi05-path", type=str, required=True,
                     help="Frozen π0.5 pretrained_model directory (recorded in config, not saved)")
     ap.add_argument("--output-dir", type=Path, required=True,
@@ -196,10 +197,8 @@ def main() -> None:
     if ck1.get("rlt_architecture") != "paper_v1" or not ck1.get("image_only", False):
         raise SystemExit(f"Stage-1 checkpoint must be paper_v1 image-only: {args.stage1_checkpoint}")
     ck2 = torch.load(args.stage2_checkpoint, map_location="cpu", weights_only=False)
-    if ck2.get("schema_version") not in (3, 4) or ck2.get("actor_contract") != "paper_full_output_v1":
-        raise SystemExit(
-            f"Stage-2 checkpoint must be schema v3/v4 paper_full_output_v1: {args.stage2_checkpoint}"
-        )
+    if ck2.get("schema_version") not in (3, 4):
+        raise SystemExit(f"Unsupported Stage-2 checkpoint schema: {args.stage2_checkpoint}")
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"

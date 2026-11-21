@@ -56,17 +56,30 @@ SDK 安装后还需要同版本的 Rerun Viewer。Linux x86_64 可下载
 `rerun-cli-0.33.1-x86_64-unknown-linux-gnu` 放到 `~/.local/bin/rerun-cli` 并加执行权限，
 或者使用 `cargo binstall --force rerun-cli@0.33.1`。
 
-保持 Actor 不接管并使用已有 replay 重新初始化训练 Actor/Critic：
+使用已有 replay 离线训练零初始化的 residual Actor 和新的 Twin Critic：
 
 ```bash
 ./rlt stage2-retrain \
   --source-checkpoint outputs/rlt/YOUR_RUN/final_checkpoint.pt \
+  --actor-residual-scale 0.05 \
   --output outputs/rlt/stage2_retrain_YYYYMMDD_HHMMSS
 ```
 
-该命令不连接机械臂和相机。默认按 5:1 的 replay 更新 Critic，每两次 Critic 更新一次 Actor，
-使用 `-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`），并把输出 checkpoint 和 replay journal
-写入新目录。重训结果先用于 shadow 评估，确认步进和偏差稳定后再通过 Stage 2 resume 使用。
+Actor 的网络均值为 `VLA参考 + scale * tanh(残差网络输出)`。最后一层的权重和偏置从零开始。
+默认 `scale=0.05`，单位是每个动作维度的归一化值。50% reference dropout 只屏蔽残差网络看到的参考，
+加到输出上的 VLA 参考始终保留。新回放分别记录 VLA 输入和人工纠正目标，旧回放沿用当时保存的参考。
+默认每条回放对应 5 次 Critic 更新，每两次 Critic 更新一次 Actor，使用
+`-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`）。
+重训将 checkpoint 和 replay journal 写入新目录。用 `--actor-residual-scale 0` 可训练原全量输出 Actor。
+
+从训练结果继续在线采集时，Stage 2 从 checkpoint 读取 Actor 类型和残差上限。
+用 `--actor-execute-mean` 可直接评估均值，去除固定标准差的探索采样。下面的起步步数 3 对应已有 beta10 回放。
+
+```bash
+./rlt stage2 --auto-critical --episodes 200 --actor-execute-mean \
+  --resume-from outputs/rlt/stage2_retrain_YYYYMMDD_HHMMSS/final_checkpoint.pt \
+  --start-blend-steps 3 --rtc-max-guidance-weight 8
+```
 
 更换 VLA 或示教数据后，重新提取特征并训练配套 Stage 1：
 

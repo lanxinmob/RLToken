@@ -2,7 +2,7 @@
 """Retrain the paper-style RLT Actor and Twin Critic from an existing replay journal.
 
 The script never opens a robot or camera.  It restores the execution contract
-stored with a Stage 2 checkpoint, trains fresh full-output Gaussian heads, and
+stored with a Stage 2 checkpoint, trains fresh Gaussian Actor and Twin Critic heads, and
 writes a resume-compatible Stage 2 checkpoint for later shadow evaluation.
 """
 
@@ -34,10 +34,13 @@ from rlt_action_transform import (  # noqa: E402
 from train_rlt_stage2_pi05 import (  # noqa: E402
     ReplayBuffer,
     ReplayManager,
+    actor_reference,
+    atomic_torch_save,
     batch_preparation,
     build_stage2_checkpoint,
     capture_rng_state,
     clamp_actor_action,
+    canonical_digest,
     discounted_chunk_return,
     frozen_parameters,
     polyak_update,
@@ -123,6 +126,8 @@ def main() -> None:
                         help="beta in -Q + beta * MSE(actor_action, reference_action)")
     parser.add_argument("--reference-dropout", type=float, default=0.5)
     parser.add_argument("--policy-fixed-std", type=float, default=0.01)
+    parser.add_argument("--actor-residual-scale", type=float, default=0.05,
+                        help="Maximum normalized mean correction per action dimension (0 trains a full-output Actor)")
     parser.add_argument("--actor-action-limit", type=float, default=1.0)
     parser.add_argument("--target-min", type=float, default=0.0,
                         help="Lower TD target bound for terminal 0/1 rewards")
@@ -140,6 +145,8 @@ def main() -> None:
         raise ValueError("reference-dropout must be in [0, 1]")
     if args.policy_fixed_std <= 0 or args.actor_action_limit <= 0:
         raise ValueError("policy-fixed-std and actor-action-limit must be positive")
+    if not np.isfinite(args.actor_residual_scale) or args.actor_residual_scale < 0:
+        raise ValueError("actor-residual-scale must be finite and non-negative")
     if args.target_min > args.target_max:
         raise ValueError("target-min must not exceed target-max")
 
@@ -220,6 +227,7 @@ def main() -> None:
         critic_hidden_dim=critic_hidden_dim,
         critic_num_layers=critic_num_layers,
         policy_fixed_std=args.policy_fixed_std,
+        actor_residual_scale=args.actor_residual_scale,
         discount=args.discount,
         bc_weight=args.bc_weight,
         target_tau=args.target_tau,
@@ -377,7 +385,7 @@ def main() -> None:
                     reference_q_tensor = critic.q_min(
                         batch["z_rl"],
                         critic_proprio(batch),
-                        critic_action(batch, batch["ref_chunk"], reference=True),
+                        critic_action(batch, actor_reference(actor, batch), reference=True),
                     ).mean()
                 with frozen_parameters(critic):
                     _, sampled_action = sample_training_proposal(
@@ -442,6 +450,9 @@ def main() -> None:
     shutil.copyfile(source_checkpoint_path.parent / "hardware_info.json", output_dir / "hardware_info.json") \
         if (source_checkpoint_path.parent / "hardware_info.json").is_file() else None
     runtime_provenance = copy.deepcopy(provenance)
+    runtime_provenance.update(actor_residual_scale=args.actor_residual_scale, reference_dropout=args.reference_dropout)
+    runtime_provenance.pop("digest", None)
+    runtime_provenance["digest"] = canonical_digest(runtime_provenance)
     journal_bytes = target_journal.stat().st_size
     checkpoint = build_stage2_checkpoint(
         episode=int(source_checkpoint.get("episode", 0)),
@@ -451,6 +462,7 @@ def main() -> None:
         critic_target_state_dict=critic_target.state_dict(),
         actor_optimizer=actor_optimizer.state_dict(),
         critic_optimizer=critic_optimizer.state_dict(),
+        policy_fixed_std=actor.fixed_std,
         episode_rewards=list(source_checkpoint.get("episode_rewards", [])),
         episode_interventions=list(source_checkpoint.get("episode_interventions", [])),
         total_updates=critic_updates,
@@ -470,7 +482,7 @@ def main() -> None:
         replay_journal_bytes=journal_bytes,
         replay_entries=replay.stats()["adds_total"],
     )
-    torch.save(checkpoint, output_dir / "final_checkpoint.pt")
+    atomic_torch_save(checkpoint, output_dir / "final_checkpoint.pt")
     (output_dir / "offline_config.json").write_text(
         json.dumps(vars(args), default=str, indent=2) + "\n",
         encoding="utf-8",

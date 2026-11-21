@@ -493,17 +493,15 @@ def main():
     if not (pi05_path / "config.json").is_file() or not (pi05_path / "model.safetensors").is_file():
         raise FileNotFoundError(f"Incomplete PI0.5 checkpoint: {pi05_path}")
     actor_checkpoint = torch.load(actor_path, map_location=device, weights_only=False)
+    residual_scale = checkpoint_actor_scale(actor_checkpoint)
     if (
         actor_checkpoint.get("schema_version") not in (3, 4)
-        or actor_checkpoint.get("actor_contract") != "paper_full_output_v1"
         or actor_checkpoint.get("rl_chunk_length") != 10
     ):
-        raise ValueError("--actor_checkpoint must be a paper-aligned full-output Actor checkpoint")
+        raise ValueError("--actor_checkpoint must be a supported Stage 2 Actor checkpoint")
     provenance = actor_checkpoint.get("runtime_provenance", {})
     if provenance.get("task") != args.task or provenance.get("camera_map") != args.camera_map:
         raise ValueError("Actor checkpoint task or camera map does not match this evaluation")
-    if provenance.get("actor_residual_scale", 0.0) != 0:
-        raise ValueError("Paper-aligned Actor checkpoint must use full-output mode")
     if "action_stride" in provenance and provenance["action_stride"] != 2:
         raise ValueError("Actor checkpoint action_stride must be 2 for paper-aligned stride-2 replay")
     if "actor_hidden_dim" in provenance and provenance["actor_hidden_dim"] != args.actor_hidden_dim:
@@ -533,6 +531,7 @@ def main():
         raise ValueError("--rlt_checkpoint must be an image-only paper_v1 Stage 1 checkpoint")
     rlt_config = PI05RLTConfig(
         mode="online_rl", state_dim=6, action_dim=6,
+        actor_residual_scale=residual_scale,
         action_stride=2, n_action_steps_rl=10,
     )
     encoder = RLTokenEncoder(rlt_config).to(device).eval()

@@ -71,6 +71,7 @@ def stage2_retrain(args):
                "--batch-size", str(args.batch_size),
                "--bc-weight", str(args.bc_weight),
                "--policy-fixed-std", str(args.policy_fixed_std),
+               "--actor-residual-scale", str(args.actor_residual_scale),
                "--actor-action-limit", str(args.actor_action_limit)]
     if args.replay_journal is not None:
         command.extend(["--replay-journal", args.replay_journal.resolve()])
@@ -169,6 +170,8 @@ def main():
     retrain.add_argument("--bc-weight", type=float, default=10.0,
                          help="beta in the paper Actor loss")
     retrain.add_argument("--policy-fixed-std", type=float, default=0.01)
+    retrain.add_argument("--actor-residual-scale", type=float, default=0.05,
+                         help="Maximum normalized correction to the VLA mean (0 trains a full-output Actor)")
     retrain.add_argument("--actor-action-limit", type=float, default=1.0)
     args = parser.parse_args()
     if args.command == "check":

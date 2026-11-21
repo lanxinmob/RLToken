@@ -43,6 +43,19 @@ SO101_JOINT_NAMES = (
 ARX_JOINT_NAMES = tuple(f"joint_{index}" for index in range(1, 7)) + ("gripper",)
 
 
+def actor_contract_for_scale(scale: float) -> str:
+    if not np.isfinite(scale) or scale < 0:
+        raise ValueError("Actor residual scale must be finite and non-negative")
+    return "vla_residual_v1" if scale > 0 else "paper_full_output_v1"
+
+
+def checkpoint_actor_scale(checkpoint: dict) -> float:
+    scale = float(checkpoint.get("runtime_provenance", {}).get("actor_residual_scale", 0.0))
+    if checkpoint.get("actor_contract") != actor_contract_for_scale(scale):
+        raise ValueError(f"Incompatible Actor contract {checkpoint.get('actor_contract')!r} for residual scale {scale}")
+    return scale
+
+
 def _canonical_joint_name(name: str) -> str:
     """Normalize LeRobot action feature names to bare SO-101 joint names."""
     value = str(name).strip()
@@ -261,12 +274,15 @@ class Transition:
     preparation: dict[str, np.ndarray] | None = None
     next_preparation: dict[str, np.ndarray] | None = None
     execution_timing: np.ndarray | None = None
+    vla_ref_chunk: np.ndarray | None = None  # Original VLA plan before intervention targets replace any rows.
 
     def to_numpy(self) -> dict[str, np.ndarray]:
         return {
             "z_rl": _ensure_array(self.z_rl, dtype=np.float16),
             "proprio": _ensure_array(self.proprio, dtype=np.float32),
             "ref_chunk": _ensure_array(self.ref_chunk, dtype=np.float16),
+            "vla_ref_chunk": _ensure_array(self.ref_chunk if self.vla_ref_chunk is None else self.vla_ref_chunk,
+                                           dtype=np.float16),
             "action_chunk": _ensure_array(self.action_chunk, dtype=np.float16),
             "requested_chunk": _ensure_array(
                 self.action_chunk if self.requested_chunk is None else self.requested_chunk,
@@ -590,6 +606,7 @@ def parse_max_relative_target(value: str | None) -> float | dict[str, float] | N
 
 
 __all__ = [
+    "actor_contract_for_scale", "checkpoint_actor_scale",
     "SO101_JOINT_NAMES",
     "action_order_indices",
     "reorder_action_tensor",
