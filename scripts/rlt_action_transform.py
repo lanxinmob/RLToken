@@ -100,6 +100,10 @@ def blend_policy_handoff(targets, handoff, previous_policy, *, actor, steps):
     prefix = (1 - u).square() * ((1 + 2 * u) * start + u * n * incoming)
     prefix = prefix + u.square() * ((3 - 2 * u) * end + (u - 1) * n * outgoing)
     # Previous policy: -1 = no policy history, 0 = VLA, 1 = Actor.
+    # Replay metadata can come from a CPU snapshot while the current policy
+    # targets are on CUDA. Normalize the gate to the target device before the
+    # torch.where below so handoff blending is device-independent.
+    previous_policy = torch.as_tensor(previous_policy, device=targets.device)
     enabled = previous_policy.reshape(-1, 1, 1) >= (0 if actor else 1)
     prefix = torch.where(enabled, prefix, joints[:, :n - 1])
     blended_joints = torch.cat([prefix, joints[:, n - 1:]], dim=1)

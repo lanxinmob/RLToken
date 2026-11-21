@@ -38,6 +38,17 @@ def _is_scalar(x):
     )
 
 
+def _is_image_array(arr: np.ndarray) -> bool:
+    """Recognize camera/depth arrays without treating small state matrices as images."""
+    if arr.ndim == 2:
+        return min(arr.shape) > 16
+    if arr.ndim != 3:
+        return False
+    channel_first = arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4)
+    channel_last = arr.shape[-1] in (1, 3, 4)
+    return channel_first or channel_last
+
+
 def init_rerun(
     session_name: str = "lerobot_control_loop", ip: str | None = None, port: int | None = None
 ) -> None:
@@ -179,8 +190,8 @@ def log_rerun_data(
                 # Convert CHW -> HWC when needed
                 if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
                     arr = np.transpose(arr, (1, 2, 0))
-                if arr.ndim == 1:
-                    rr.log(key, rr.Scalars(arr.astype(float)))
+                if not _is_image_array(arr):
+                    rr.log(key, rr.Scalars(arr.reshape(-1).astype(float)))
                     observation_paths.add(key)
                 else:
                     if arr.shape[-1] == 1:
@@ -192,7 +203,11 @@ def log_rerun_data(
                             colormap=rr.components.Colormap.Viridis,
                         )
                     else:
-                        img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
+                        img_entity = (
+                            rr.Image(arr).compress()
+                            if compress_images and arr.dtype == np.uint8
+                            else rr.Image(arr)
+                        )
                     rr.log(key, entity=img_entity, static=True)
                     image_paths.add(key)
 
