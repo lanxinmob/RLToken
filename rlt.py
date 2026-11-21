@@ -96,7 +96,7 @@ def main():
             online.add_argument("--dry-run", action="store_true")
             online.add_argument("--resume-from", type=Path)
             online.add_argument("--start-blend-steps", dest="start_blend_steps", type=int,
-                                help="Ease from the measured pose over N ticks at episode start")
+                                help="Ease from the current pose over N commands at episode start and after HIL")
             online.add_argument("--vla-only", dest="vla_only", action="store_true",
                                 help="Deployment validation: VLA executes, no actor/critic updates")
             online.add_argument("--exec-grid-hz", dest="exec_grid_hz", type=float, default=None,

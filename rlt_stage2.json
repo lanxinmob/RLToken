@@ -58,7 +58,7 @@
   },
   "control_fps": 30,
   "exec_grid_hz": 100,
-  "start_blend_steps": 3,
+  "start_blend_steps": 6,
   "actor_handoff_steps": 5,
   "rtc_enabled": true,
   "rtc_mode": "guided",
