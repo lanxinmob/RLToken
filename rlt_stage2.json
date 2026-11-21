@@ -87,7 +87,6 @@
   "td_target_min": 0.0,
   "td_target_max": 1.0,
   "actor_action_limit": 1.0,
-  "actor_gate_advantage": 0.0,
   "actor_execution_steps": 0,
   "observation_retries": 0,
   "save_debug_obs": true

@@ -365,14 +365,14 @@ def main() -> None:
             reference_q = float("nan")
             bc_penalty_value = float("nan")
             if critic_updates % args.critic_per_actor == 0:
-                gate_mean, _ = sample_training_proposal(
+                rollout_mean, _ = sample_training_proposal(
                     actor, batch, 0.0, args.actor_action_limit,
                 )
                 with torch.no_grad():
                     actor_q_tensor = critic.q_min(
                         batch["z_rl"],
                         critic_proprio(batch),
-                        critic_action(batch, gate_mean),
+                        critic_action(batch, rollout_mean),
                     ).mean()
                     reference_q_tensor = critic.q_min(
                         batch["z_rl"],
@@ -464,8 +464,6 @@ def main() -> None:
         execution_timing=timeline.profile(),
         actor_handoff_steps=actor_handoff_steps,
         critic_action_steps=timeline.steps,
-        actor_gate_advantage=None,
-        actor_gate_policy="mean",
         runtime_provenance=runtime_provenance,
         rng_state=capture_rng_state(),
         replay_rng_state=copy.deepcopy(buffer._rng.bit_generator.state),

@@ -2328,8 +2328,8 @@ def parse_args():
                              "mean (≈ reference) so execution is smooth like the VLA.")
     parser.add_argument("--actor_action_limit", type=float, default=1.0,
                         help="Absolute normalized Actor output limit before execution and critic evaluation")
-    parser.add_argument("--actor_gate_advantage", type=float, default=0.0,
-                        help="Require batch-mean Q(actor)-Q(reference) to exceed this value before Actor execution")
+    # Accept the obsolete threshold in older Stage 2 configs and command lines.
+    parser.add_argument("--actor_gate_advantage", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--actor_noise_std", type=float, default=0.0,
                         help="Exploration noise (normalized space) added on top of the mean when "
                              "actor_execute_mean is on (e.g. 0.01 = small exploration without full "
@@ -2518,8 +2518,6 @@ def main():
         raise ValueError("Paper-aligned RLT uses a full-output Actor; --actor_residual_scale must be 0.")
     if args.actor_action_limit <= 0 or not math.isfinite(args.actor_action_limit):
         raise ValueError("--actor_action_limit must be finite and positive.")
-    if not math.isfinite(args.actor_gate_advantage):
-        raise ValueError("--actor_gate_advantage must be finite.")
     if args.intervention_reward_bonus != 0:
         raise ValueError(
             "Paper-aligned RLT uses terminal-only binary rewards; --intervention_reward_bonus must be 0."
@@ -2595,10 +2593,8 @@ def main():
     logger.info("  dry_run         = %s | max_relative_target = %s",
                 args.dry_run, args.max_relative_target if args.max_relative_target else "disabled")
     logger.info("  actor_max_relative_target = disabled (rejected if configured; use the ARX execution contract)")
-    logger.info("  actor_noise_std = %s | actor_execute_mean = %s | actor_action_limit = ±%s | "
-                "actor_gate_advantage = %s | control_fps = %s",
-                args.actor_noise_std, args.actor_execute_mean, args.actor_action_limit,
-                args.actor_gate_advantage, args.control_fps)
+    logger.info("  actor_noise_std = %s | actor_execute_mean = %s | actor_action_limit = ±%s | control_fps = %s",
+                args.actor_noise_std, args.actor_execute_mean, args.actor_action_limit, args.control_fps)
     logger.info("  leader_mirror_torque_limit = %s | intervention_threshold = %s",
                 args.leader_mirror_torque_limit, args.intervention_threshold)
     logger.info("  leader_hil_min_dwell_s = %s | intervention_release_frames = %s",
@@ -3614,8 +3610,6 @@ def main():
                 )
             )
 
-        latest_actor_advantage: float | None = None
-
         def save_stage2_checkpoint(path: Path, episode: int, episode_rewards: list, episode_interventions: list) -> None:
             journal_path = output_dir / "replay_journal.pkl"
             journal_bytes = journal_path.stat().st_size if journal_path.exists() else 0
@@ -3641,8 +3635,6 @@ def main():
                     execution_timing=timeline.profile(),
                     actor_handoff_steps=timeline.actor_handoff_steps,
                     critic_action_steps=command_horizon,
-                    actor_gate_advantage=latest_actor_advantage,
-                    actor_gate_policy="mean",
                     runtime_provenance=runtime_provenance,
                     rng_state=capture_rng_state(),
                     replay_rng_state=copy.deepcopy(buffer._rng.bit_generator.state),
@@ -3672,10 +3664,6 @@ def main():
         logger.info(
             f"Actor execution starts after {args.actor_start_updates} completed RL updates "
             f"(VLA remains in control until then)."
-        )
-        logger.info(
-            "Actor gate requires batch-mean Q(actor)-Q(reference) > %.4f; the gate starts closed.",
-            args.actor_gate_advantage,
         )
         logger.info(
             "Automatic HIL: move any leader joint to align it to the follower and enter direct-follow; "
@@ -3712,29 +3700,12 @@ def main():
             if resume_checkpoint is not None and not timing_changed and resume_checkpoint.get("execution_contract") == EXECUTION_CONTRACT
             else 0
         )
-        resume_advantage = (
-            float(resume_checkpoint["actor_gate_advantage"])
-            if resume_checkpoint is not None and resume_checkpoint.get("execution_timing") == timeline.profile()
-            and resume_checkpoint.get("actor_handoff_steps", 0) == timeline.actor_handoff_steps
-            and resume_checkpoint.get("actor_gate_policy") == "mean"
-            and resume_checkpoint.get("actor_gate_advantage") is not None
-            else None
-        )
         if resume_checkpoint is not None and action_transform is not None:
             saved_transform = resume_checkpoint.get("execution_transform")
             if saved_transform is not None and execution_transform_diff(saved_transform, action_transform.profile):
-                # The saved Q comparison and the aligned-update budget were
-                # measured under a different accepted-target transform.  Keep
-                # the takeover gate closed until the learner produces a fresh
-                # comparison AND accumulates the full fresh-contract update
-                # budget; otherwise the old count can open the gate early.
-                resume_advantage = None
                 aligned_critic_updates = 0
-                logger.info(
-                    "Actor gate reset on resume because the execution transform changed; "
-                    "aligned_critic_updates reset to 0 for the new contract."
-                )
-        latest_actor_advantage = resume_advantage
+                logger.info("Reset aligned_critic_updates to 0 for the new execution transform.")
+        latest_actor_advantage: float | None = None
         logger.info("Update counters: critic_updates=%d | actor_updates=%d", critic_updates, actor_updates)
         if action_transform is not None:
             logger.info("Actor readiness: aligned_critic_updates=%d/%d; need %d replay windows with controller state.",
@@ -3967,11 +3938,8 @@ def main():
 
                 # ── Actor update (paper: two critic updates per actor update) ──
                 if total_updates % args.critic_per_actor == 0:
-                    # The takeover gate compares the actor used at execution
-                    # time against the same full VLA reference. Reference
-                    # dropout remains a training regularizer for the actor
-                    # loss, but must not make the gate itself stochastic.
-                    gate_mean, q_sample = sample_training_proposal(
+                    # Report the Q of the Actor mean conditioned on the full VLA reference.
+                    rollout_mean, q_sample = sample_training_proposal(
                         actor, batch, 0.0, args.actor_action_limit,
                     )
 
@@ -3985,7 +3953,7 @@ def main():
                         ).mean()
                     with torch.no_grad():
                         actor_q = critic.q_min(
-                            batch["z_rl"], critic_proprio(batch), critic_action(batch, gate_mean),
+                            batch["z_rl"], critic_proprio(batch), critic_action(batch, rollout_mean),
                         ).mean()
                         reference_q = critic.q_min(
                             batch["z_rl"].detach(), critic_proprio(batch),
@@ -4121,7 +4089,7 @@ def main():
                         if total_updates % args.metrics_log_every == 0:
                             logger.info(
                                 "[RL] critic_updates=%d | actor_updates=%d | aligned_critic_updates=%d | "
-                                "actor_gate_advantage=%s",
+                                "actorAdv=%s",
                                 critic_updates, actor_updates, aligned_critic_updates,
                                 "-" if latest_actor_advantage is None else f"{latest_actor_advantage:.5f}",
                             )
@@ -5403,10 +5371,6 @@ def main():
                     or ((aligned_critic_updates if action_transform is not None else total_updates)
                         < args.actor_start_updates and not args.inference_only)
                     or not ACTOR_ENABLED
-                    or (not args.inference_only and (
-                        latest_actor_advantage is None
-                        or latest_actor_advantage <= args.actor_gate_advantage
-                    ))
                 ):
                     requested_actions = vla_actions
                     action_source = "VLA"
@@ -5587,7 +5551,7 @@ def main():
                             "action.rlt/critical": int(window_critical_active),
                             "action.rlt/episode": episode,
                             "action.rlt/episode_step": episode_step_counter,
-                            "action.rlt/actor_gate_advantage": latest_actor_advantage,
+                            "action.rlt/actor_advantage": latest_actor_advantage,
                         })
                     if action_source == "ACTOR" and not actor_control_active:
                         actor_control_active = True
