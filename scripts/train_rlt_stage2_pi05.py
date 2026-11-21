@@ -1001,6 +1001,26 @@ def joint_jump_metrics(targets, previous, max_step):
     }
 
 
+def format_shadow_episode(episode, rows, max_step):
+    valid = [row for row in rows if "error" not in row]
+    ticks = sum(row["ticks"] for row in valid)
+    limits = max_step[:-1].rad2deg().tolist()  # The last channel is the gripper, in metres.
+    if all(limit == limits[0] for limit in limits):
+        ranges = f"0..{limits[0]:.2f} deg/tick"
+    else:
+        ranges = " ".join(f"J{i}=0..{limit:.2f}" for i, limit in enumerate(limits, 1)) + " deg/tick"
+    fields = [f"[SHADOW] episode={episode} valid_windows={len(valid)}/{len(rows)} ticks={ticks}"]
+    if valid:
+        for source in ("mean", "actor", "vla"):
+            peak = max(row[source]["peak_step_deg"] for row in valid)
+            over = sum(row[source]["over_limit_steps"] for row in valid)
+            fields.append(f"{source} peak_step_deg={peak:.2f} over_limit_steps={over}/{ticks}")
+    else:
+        fields.append("no valid shadow windows (metrics unavailable)")
+    fields.append(f"reference peak_step_deg={ranges}, over_limit_steps target=0")
+    return " | ".join(fields)
+
+
 @torch.no_grad()
 def actor_shadow_metrics(actor, boundary, args, timeline, unnormalize_action, max_step, generator):
     """Evaluate the Actor on a real VLA boundary in pre-SDK radians and metres."""
@@ -3797,7 +3817,8 @@ def main():
         # continuously samples replay and updates actor/critic in the background.
         training_lock = threading.Lock()
         training_stop = threading.Event()
-        shadow_windows = queue.SimpleQueue()
+        shadow_windows = queue.Queue()
+        shadow_rows = []
         if shadow_training:
             shadow_rng = torch.Generator(device=device).manual_seed(args.seed)
             shadow_max_step = action_transform.max_step.cpu()
@@ -3810,9 +3831,10 @@ def main():
             try:
                 row.update(actor_shadow_metrics(actor, boundary, args, timeline, unnormalize_action,
                                                 shadow_max_step, shadow_rng))
-            except (RuntimeError, TypeError, ValueError) as exc:
+            except Exception as exc:
                 row["error"] = str(exc)
                 logger.exception("Could not evaluate Actor shadow at step %d", boundary.step_id)
+            shadow_rows.append(row)
             with shadow_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(row, allow_nan=False) + "\n")
             if visualization is not None and "error" not in row:
@@ -4063,21 +4085,25 @@ def main():
 
         def training_worker() -> None:
             while True:
-                stopping = training_stop.is_set() or SHUTDOWN or EMERGENCY_STOP
-                if not stopping and planner is not None and planner.busy.is_set():
+                # A quit can arrive during the final send. Drain shadow work until the rollout closes the queue.
+                stopping = training_stop.is_set()
+                rollout_stopped = SHUTDOWN or EMERGENCY_STOP
+                if not (stopping or rollout_stopped) and planner is not None and planner.busy.is_set():
                     training_stop.wait(0.002)
                     continue
                 if shadow_training and not shadow_windows.empty():
                     try:
                         record_shadow(shadow_windows.get_nowait())
-                    except OSError:
-                        logger.exception("Could not write Actor shadow metrics")
+                    except Exception:
+                        logger.exception("Could not publish Actor shadow metrics")
+                    finally:
+                        shadow_windows.task_done()
                 if stopping:
                     if shadow_windows.empty():
                         return
                     continue
-                if args.vla_only or completed_episode < args.warmup_episodes:
-                    time.sleep(0.05)
+                if rollout_stopped or args.vla_only or completed_episode < args.warmup_episodes:
+                    training_stop.wait(0.05)
                     continue
                 if len(buffer) < args.batch_size:
                     time.sleep(0.05)
@@ -5691,6 +5717,15 @@ def main():
                     hold_follower_at_current_pose("episode end")
             if planner is not None and not planner.join(args.inference_timeout_s):
                 raise TimeoutError("Background pi0.5 inference did not finish after rollout stopped")
+            if shadow_training:
+                # All requests for this attempt have been submitted. Include the last
+                # evaluation before presenting the reward prompt or retrying the same episode.
+                shadow_windows.join()
+                summary = format_shadow_episode(episode, shadow_rows, shadow_max_step)
+                shadow_rows.clear()
+                logger.info("%s", summary)
+                append_metrics_line(f"# {summary}")
+                print(summary, flush=True)
             # Write per-step debug records (state / target / sent / source).
             if debug_dir is not None and debug_steps:
                 try:
