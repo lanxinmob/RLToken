@@ -2826,7 +2826,7 @@ def main():
         num_layers=args.actor_num_layers,
     ).to(device)
     actor.fixed_std = args.policy_fixed_std
-    logger.info("Actor mode: paper full-output with reference pass-through and BC regularization")
+    logger.info("Actor mode: full-output MLP conditioned on the reference chunk, with BC regularization")
     actor_target = copy.deepcopy(actor).to(device)
     for p in actor_target.parameters():
         p.requires_grad = False
@@ -3573,6 +3573,7 @@ def main():
                     actor_handoff_steps=timeline.actor_handoff_steps,
                     critic_action_steps=command_horizon,
                     actor_gate_advantage=latest_actor_advantage,
+                    actor_gate_policy="mean",
                     runtime_provenance=runtime_provenance,
                     rng_state=capture_rng_state(),
                     replay_rng_state=copy.deepcopy(buffer._rng.bit_generator.state),
@@ -3646,6 +3647,7 @@ def main():
             float(resume_checkpoint["actor_gate_advantage"])
             if resume_checkpoint is not None and not timing_changed
             and resume_checkpoint.get("actor_handoff_steps", 0) == timeline.actor_handoff_steps
+            and resume_checkpoint.get("actor_gate_policy") == "mean"
             and resume_checkpoint.get("actor_gate_advantage") is not None
             else None
         )
@@ -3884,7 +3886,7 @@ def main():
                     # time against the same full VLA reference. Reference
                     # dropout remains a training regularizer for the actor
                     # loss, but must not make the gate itself stochastic.
-                    _gate_mean, gate_action = sample_training_proposal(
+                    gate_mean, q_sample = sample_training_proposal(
                         actor, batch, 0.0, args.actor_action_limit,
                     )
 
@@ -3892,10 +3894,13 @@ def main():
                     # BC ignores those rows, so Q must see the same padding;
                     # otherwise the actor can increase Q without a BC penalty
                     # by driving the unexecuted actions arbitrarily far away.
-                    critic_action_value = critic_action(batch, gate_action)
                     with frozen_parameters(critic):
+                        sampled_actor_q = critic.q_min(
+                            batch["z_rl"].detach(), critic_proprio(batch), critic_action(batch, q_sample),
+                        ).mean()
+                    with torch.no_grad():
                         actor_q = critic.q_min(
-                            batch["z_rl"].detach(), critic_proprio(batch), critic_action_value
+                            batch["z_rl"], critic_proprio(batch), critic_action(batch, gate_mean),
                         ).mean()
                         reference_q = critic.q_min(
                             batch["z_rl"].detach(), critic_proprio(batch),
@@ -3942,7 +3947,7 @@ def main():
 
                     actor_loss = (
                         bc_weight * bc_penalty
-                        - q_weight * actor_q
+                        - q_weight * sampled_actor_q
                         + delta_weight * delta_penalty
                     )
 
