@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import pickle
+import queue
 import random
 import signal
 import select
@@ -73,7 +74,7 @@ from rlt_action_transform import (
 SHUTDOWN = False
 EMERGENCY_STOP = False
 GRACEFUL_QUIT_REQUESTED = False
-ACTOR_ENABLED = False  # Initialized from auto_critical in main; 'a' toggles permission.
+ACTOR_ENABLED = False  # The operator toggles execution with 'a'.
 SKIP_EPISODE = False  # Skip to next episode with 'g' key
 FINISH_EPISODE = False  # Finish current episode early with 'f' key (still asks y/n for terminal reward)
 CRITICAL_PHASE_ACTIVE = False  # Training: stays on until manual c/f; resets each episode
@@ -117,9 +118,8 @@ class ConsoleInputManager:
         15:15:49  Actor mode requires the critical phase: press 'c' first
         15:15:53  Actor mode ON          (only succeeded after pressing 'c')
 
-    In automatic mode Actor permission starts enabled. The 'a' key toggles this
-    permission without bypassing the warmup, update-count or critical-phase
-    gates. A manual disable remains in effect across episodes.
+    ARX online training starts with Actor permission off. The 'a' key toggles
+    permission across episodes without bypassing the training and critical-phase gates.
     """
 
     def __init__(self, stream=None, *, auto_critical: bool = False):
@@ -976,22 +976,60 @@ def build_stride2_transitions(
 
 
 
-def sample_fixed_std_action(mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+def sample_fixed_std_action(mean: torch.Tensor, std: torch.Tensor | float, *, generator=None) -> torch.Tensor:
     """Sample one temporally coherent Gaussian perturbation per action chunk."""
-    if mean.ndim >= 2:
-        noise = torch.randn_like(mean[..., :1, :]).expand_as(mean)
-    else:
-        noise = torch.randn_like(mean)
+    shape = mean[..., :1, :].shape if mean.ndim >= 2 else mean.shape
+    noise = torch.randn(shape, device=mean.device, dtype=mean.dtype, generator=generator)
     return mean + std * noise
 
 
-def add_chunk_noise(action: torch.Tensor, std: float) -> torch.Tensor:
-    """Add one normalized-space noise vector to every row of an action chunk."""
-    if std <= 0:
-        return action
-    if action.ndim < 2:
-        return action + torch.randn_like(action) * std
-    return action + torch.randn_like(action[..., :1, :]).expand_as(action) * std
+def actor_rollout_proposal(mean, std, args, *, generator=None):
+    if not args.actor_execute_mean:
+        mean = sample_fixed_std_action(mean, std, generator=generator)
+    elif args.actor_noise_std > 0:
+        mean = sample_fixed_std_action(mean, args.actor_noise_std, generator=generator)
+    return clamp_actor_action(mean, args.actor_action_limit)
+
+
+def joint_jump_metrics(targets, previous, max_step):
+    """ARX pre-SDK joint requests in physical units, including the first step from the accepted pose."""
+    joints = targets[:, :-1]
+    increments = torch.diff(joints, dim=0, prepend=previous[None, :-1]).abs()
+    return {
+        "peak_step_deg": increments.max().rad2deg().item(),
+        "over_limit_steps": int((increments > max_step[:-1] + 1e-6).any(dim=1).sum().item()),
+    }
+
+
+@torch.no_grad()
+def actor_shadow_metrics(actor, boundary, args, timeline, unnormalize_action, max_step, generator):
+    """Evaluate the Actor on a real VLA boundary in pre-SDK radians and metres."""
+    mean, std = actor(boundary.z_rl, boundary.proprio.unsqueeze(0), boundary.ref_chunk)
+    proposal = actor_rollout_proposal(mean, std, args, generator=generator)
+    mean = clamp_actor_action(mean, args.actor_action_limit)
+
+    def prepare(actions):
+        commands = timeline.prepare(actions, boundary.preparation, execution_scale=args.actor_execution_scale,
+                                    actor=True)
+        return unnormalize_action(commands)[0].cpu()
+
+    candidate = prepare(proposal)
+    deterministic = prepare(mean)
+    vla = unnormalize_action(boundary.reference_targets)[0].cpu()
+    if boundary.execution_state is None:
+        raise ValueError("Missing previous accepted ARX target")
+    previous = torch.as_tensor(boundary.execution_state[0])
+    if not all(torch.isfinite(x).all() for x in (candidate, deterministic, vla, previous)):
+        raise ValueError("Non-finite ARX shadow trajectory or anchor")
+    deviation = (candidate - vla).abs()
+    return {
+        "ticks": len(candidate),
+        "actor": joint_jump_metrics(candidate, previous, max_step),
+        "mean": joint_jump_metrics(deterministic, previous, max_step),
+        "vla": joint_jump_metrics(vla, previous, max_step),
+        "peak_actor_vla_deg": deviation[:, :-1].max().rad2deg().item(),
+        "peak_actor_vla_gripper_mm": deviation[:, -1].max().item() * 1000,
+    }
 
 
 def resampled_chunk_length(source_steps: int, *, source_hz: float, target_hz: float) -> int:
@@ -2185,7 +2223,7 @@ def parse_args():
     parser.add_argument("--auto_critical", action="store_true",
                         help="Automatically start the critical phase with a trained classifier "
                              "and keep training active until manual 'c' OFF or episode finish. "
-                             "Enable Actor permission at startup (warmup/update gates still apply). "
+                             "ARX online training requires manual Actor permission. "
                              "Requires --critical_classifier; 'a' toggles permission and 'c' overrides detection.")
     parser.add_argument("--critical_classifier", type=str, default=None,
                         help="Path to a trained critical-phase classifier checkpoint "
@@ -2412,7 +2450,8 @@ def main():
             "--actor_max_relative_target is disabled: actor-only clipping is not part of the "
             "trained execution contract"
         )
-    ACTOR_ENABLED = bool(args.auto_critical)
+    shadow_training = args.hardware_backend == "rlt_stage2" and not (args.inference_only or args.vla_only)
+    ACTOR_ENABLED = bool(args.auto_critical and not shadow_training)
     if args.control_fps <= 0:
         raise ValueError("--control_fps must be positive.")
     if args.reset_steps < 1:
@@ -3758,6 +3797,31 @@ def main():
         # continuously samples replay and updates actor/critic in the background.
         training_lock = threading.Lock()
         training_stop = threading.Event()
+        shadow_windows = queue.SimpleQueue()
+        if shadow_training:
+            shadow_rng = torch.Generator(device=device).manual_seed(args.seed)
+            shadow_max_step = action_transform.max_step.cpu()
+            shadow_path = output_dir / "actor_shadow.jsonl"
+            print(f"[Actor OFF] VLA executes. Shadow metrics: {shadow_path}. Press 'a' to allow Actor takeover.",
+                  flush=True)
+
+        def record_shadow(boundary):
+            row = {"episode": boundary.episode_id, "step": boundary.step_id, "actor_updates": actor_updates}
+            try:
+                row.update(actor_shadow_metrics(actor, boundary, args, timeline, unnormalize_action,
+                                                shadow_max_step, shadow_rng))
+            except (RuntimeError, TypeError, ValueError) as exc:
+                row["error"] = str(exc)
+                logger.exception("Could not evaluate Actor shadow at step %d", boundary.step_id)
+            with shadow_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, allow_nan=False) + "\n")
+            if visualization is not None and "error" not in row:
+                visualization.publish_debug(observation={
+                    "observation.rlt/shadow/actor_peak_step_deg": row["actor"]["peak_step_deg"],
+                    "observation.rlt/shadow/vla_peak_step_deg": row["vla"]["peak_step_deg"],
+                    "observation.rlt/shadow/actor_over_limit_steps": row["actor"]["over_limit_steps"],
+                    "observation.rlt/shadow/peak_actor_vla_deg": row["peak_actor_vla_deg"],
+                })
 
         def perform_training_update() -> bool:
             """Run one critic update and (every critic_per_actor updates) one actor update."""
@@ -3998,9 +4062,19 @@ def main():
                 return True
 
         def training_worker() -> None:
-            while not training_stop.is_set() and not SHUTDOWN and not EMERGENCY_STOP:
-                if planner is not None and planner.busy.is_set():
+            while True:
+                stopping = training_stop.is_set() or SHUTDOWN or EMERGENCY_STOP
+                if not stopping and planner is not None and planner.busy.is_set():
                     training_stop.wait(0.002)
+                    continue
+                if shadow_training and not shadow_windows.empty():
+                    try:
+                        record_shadow(shadow_windows.get_nowait())
+                    except OSError:
+                        logger.exception("Could not write Actor shadow metrics")
+                if stopping:
+                    if shadow_windows.empty():
+                        return
                     continue
                 if args.vla_only or completed_episode < args.warmup_episodes:
                     time.sleep(0.05)
@@ -5318,20 +5392,7 @@ def main():
                             action_mean, action_std = actor(
                                 z_rl, boundary.proprio.unsqueeze(0), ref_actions,
                             )
-                            if args.actor_execute_mean:
-                                # Deterministic execution: no sampling jitter.
-                                requested_actions = action_mean
-                                if args.actor_noise_std > 0:
-                                    # One exploration vector per chunk keeps the
-                                    # trajectory coherent at the 30 Hz boundary.
-                                    requested_actions = add_chunk_noise(
-                                        requested_actions, args.actor_noise_std,
-                                    )
-                            else:
-                                requested_actions = sample_fixed_std_action(action_mean, action_std)
-                            requested_actions = clamp_actor_action(
-                                requested_actions, args.actor_action_limit,
-                            )
+                            requested_actions = actor_rollout_proposal(action_mean, action_std, args)
                     action_source = "ACTOR"
                     current_source = int(TransitionSource.RL)
                     episode_actor_executed = True  # the Actor intervened in this episode (took over execution)
@@ -5482,6 +5543,8 @@ def main():
                     if actual_target is None:
                         SHUTDOWN = True
                         break
+                    if action_offset == 0 and shadow_training and window_critical_active and action_source == "VLA":
+                        shadow_windows.put(boundary)
                     if visualization is not None:
                         vla_target = unnormalize_action(
                             reference_command_rows[action_offset].to(device)

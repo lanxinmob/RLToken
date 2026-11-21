@@ -148,7 +148,9 @@ class RerunVisualizationManager:
             return
         with self._condition:
             if observation:
-                self._debug_observation = self._copy_values(observation)
+                if self._debug_observation is None:
+                    self._debug_observation = {}
+                self._debug_observation.update(self._copy_values(observation))
             if action:
                 self._debug_action = self._copy_values(action)
             self._condition.notify()

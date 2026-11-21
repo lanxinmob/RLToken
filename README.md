@@ -18,6 +18,18 @@ bash setup_arx.sh
 第 5 个控制周期接回新块原定的位置和速度（30 Hz 下约 167 ms），夹爪沿用原定时序。
 设为 0 可关闭换块过渡。`start_blend_steps` 单独控制回合起步。
 
+ARX 在线训练每次启动或续训都由 VLA 执行。进入关键阶段后可用 `h` 人工纠正，按 `f` 后用
+`y` 或 `n` 保留回合和反馈。满足 warmup 和回放条件后，Actor 与 Critic 在后台更新。
+执行 VLA 的关键阶段，learner 用同一观测评估 Actor，在本次输出目录写入 `actor_shadow.jsonl`；
+可用 `tail -f "$RUN/actor_shadow.jsonl"` 跟踪，其中 `RUN` 是本次运行的输出目录。
+
+每行对应一个 VLA 窗口。`actor` 按当前执行采样配置生成候选，`mean` 使用 Actor 均值，
+`vla` 是对照。三者的 `peak_step_deg` 和 `over_limit_steps` 覆盖整块六个关节的限速前指令，
+包含从上一条已接受指令到首帧的变化。`peak_actor_vla_deg` 记录同一控制步最大的关节目标偏差；
+夹爪偏差单独以毫米计。观察不同起始姿态与抓取、放置阶段的这些数值后，由操作者按 `a`
+允许 Actor 接管，已有的 warmup、更新次数和 Q 门控仍生效。再按 `a` 会在后续动作块交回 VLA；
+`h` 可随时请求人工接管。影子评估的候选只用于比较，回放记录实机实际执行的数据。
+
 要在 Rerun 中查看相机、VLA 目标、Actor 选中目标和 SDK 实际接受的目标，可运行：
 
 ```bash
