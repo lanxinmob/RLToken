@@ -2,7 +2,7 @@
 """Export RL-Token-Pi05 stage checkpoints into a lerobot-native pretrained dir.
 
 Bridges the legacy v1.x artifacts (stage1 ``best_checkpoint.pt`` +
-stage2 ``final_checkpoint.pt``, schema v3) into the standard lerobot layout
+stage2 ``final_checkpoint.pt``, schema v3/v4) into the standard lerobot layout
 ``<output>/pretrained_model/{config.json, model.safetensors}`` understood by
 ``PI05RLTPolicy.from_pretrained`` / ``lerobot`` checkpoint tooling (hub push,
 record-style loading, future eval).
@@ -177,7 +177,7 @@ def main() -> None:
     ap.add_argument("--stage1-checkpoint", type=Path, required=True,
                     help="Stage-1 .pt (encoder/decoder), paper_v1 image-only")
     ap.add_argument("--stage2-checkpoint", type=Path, required=True,
-                    help="Stage-2 .pt (schema v3, paper_full_output_v1)")
+                    help="Stage-2 .pt (schema v3/v4, paper_full_output_v1)")
     ap.add_argument("--pi05-path", type=str, required=True,
                     help="Frozen π0.5 pretrained_model directory (recorded in config, not saved)")
     ap.add_argument("--output-dir", type=Path, required=True,
@@ -196,9 +196,9 @@ def main() -> None:
     if ck1.get("rlt_architecture") != "paper_v1" or not ck1.get("image_only", False):
         raise SystemExit(f"Stage-1 checkpoint must be paper_v1 image-only: {args.stage1_checkpoint}")
     ck2 = torch.load(args.stage2_checkpoint, map_location="cpu", weights_only=False)
-    if ck2.get("schema_version") != 3 or ck2.get("actor_contract") != "paper_full_output_v1":
+    if ck2.get("schema_version") not in (3, 4) or ck2.get("actor_contract") != "paper_full_output_v1":
         raise SystemExit(
-            f"Stage-2 checkpoint must be schema v3 paper_full_output_v1: {args.stage2_checkpoint}"
+            f"Stage-2 checkpoint must be schema v3/v4 paper_full_output_v1: {args.stage2_checkpoint}"
         )
 
     if args.device is None:

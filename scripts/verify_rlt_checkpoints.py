@@ -3,7 +3,7 @@
 ``pi05_rlt`` policy package (single source of truth) with strict=True.
 
 This is the compatibility gate for the "lerobot-native pipeline" refactor:
-Stage-1 encoder/decoder checkpoints and Stage-2 (schema v3,
+Stage-1 encoder/decoder checkpoints and Stage-2 (schema v3/v4,
 ``paper_full_output_v1``) actor/critic checkpoints must be loadable by
 ``lerobot.policies.pi05_rlt`` modules without any key/shape conversion.
 
@@ -80,8 +80,8 @@ def verify_stage1(path: Path, device: str) -> None:
 
 def verify_stage2(path: Path, device: str) -> None:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if ckpt.get("schema_version") != 3 or ckpt.get("actor_contract") != "paper_full_output_v1":
-        raise SystemExit(f"Not a schema-v3 paper_full_output_v1 Stage-2 checkpoint: {path}")
+    if ckpt.get("schema_version") not in (3, 4) or ckpt.get("actor_contract") != "paper_full_output_v1":
+        raise SystemExit(f"Not a schema-v3/v4 paper_full_output_v1 Stage-2 checkpoint: {path}")
     # Stage-2 ckpts do not store the full config; infer from state-dict shapes.
     asd = ckpt["actor_state_dict"]
     z_state_ref_in = asd["net.0.weight"].shape[1]

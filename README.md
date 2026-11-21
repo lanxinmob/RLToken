@@ -56,6 +56,18 @@ SDK 安装后还需要同版本的 Rerun Viewer。Linux x86_64 可下载
 `rerun-cli-0.33.1-x86_64-unknown-linux-gnu` 放到 `~/.local/bin/rerun-cli` 并加执行权限，
 或者使用 `cargo binstall --force rerun-cli@0.33.1`。
 
+保持 Actor 不接管并使用已有 replay 重新初始化训练 Actor/Critic：
+
+```bash
+./rlt stage2-retrain \
+  --source-checkpoint outputs/rlt/YOUR_RUN/final_checkpoint.pt \
+  --output outputs/rlt/stage2_retrain_YYYYMMDD_HHMMSS
+```
+
+该命令不连接机械臂和相机。默认按 5:1 的 replay 更新 Critic，每两次 Critic 更新一次 Actor，
+使用 `-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`），并把输出 checkpoint 和 replay journal
+写入新目录。重训结果先用于 shadow 评估，确认步进和偏差稳定后再通过 Stage 2 resume 使用。
+
 更换 VLA 或示教数据后，重新提取特征并训练配套 Stage 1：
 
 ```bash

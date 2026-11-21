@@ -61,6 +61,26 @@ def stage1(args):
     run(command)
 
 
+def stage2_retrain(args):
+    command = [sys.executable, ROOT / "scripts/retrain_rlt_from_replay.py",
+               "--source-checkpoint", args.source_checkpoint.resolve(),
+               "--output-dir", args.output.resolve(),
+               "--device", args.device,
+               "--updates", str(args.updates),
+               "--utd-ratio", str(args.utd_ratio),
+               "--batch-size", str(args.batch_size),
+               "--bc-weight", str(args.bc_weight),
+               "--policy-fixed-std", str(args.policy_fixed_std),
+               "--actor-action-limit", str(args.actor_action_limit)]
+    if args.replay_journal is not None:
+        command.extend(["--replay-journal", args.replay_journal.resolve()])
+    if args.stage1_checkpoint is not None:
+        command.extend(["--stage1-checkpoint", args.stage1_checkpoint.resolve()])
+    if args.stats_path is not None:
+        command.extend(["--stats-path", args.stats_path.resolve()])
+    run(command)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -130,6 +150,26 @@ def main():
                                 dest="actor_execute_mean", action="store_true",
                                 help="Execute the actor's mean action instead of a fixed-std sample; "
                                      "removes per-step exploration noise from the accepted targets")
+    retrain = commands.add_parser("stage2-retrain")
+    retrain.add_argument("--source-checkpoint", type=Path, required=True,
+                         help="Existing Stage 2 checkpoint; its replay and ARX contract are reused")
+    retrain.add_argument("--replay-journal", type=Path,
+                         help="Override the replay journal next to the source checkpoint")
+    retrain.add_argument("--stage1-checkpoint", type=Path,
+                         help="Override the Stage 1 checkpoint stored in source provenance")
+    retrain.add_argument("--stats-path", type=Path,
+                         help="Override the quantile stats path stored in source provenance")
+    retrain.add_argument("--output", type=Path,
+                         default=OUTPUT / f"stage2_retrain_{datetime.now():%Y%m%d_%H%M%S}")
+    retrain.add_argument("--device", default="cuda")
+    retrain.add_argument("--updates", type=int, default=0,
+                         help="Critic updates, 0 means five updates per replay row")
+    retrain.add_argument("--utd-ratio", type=int, default=5)
+    retrain.add_argument("--batch-size", type=int, default=256)
+    retrain.add_argument("--bc-weight", type=float, default=10.0,
+                         help="beta in the paper Actor loss")
+    retrain.add_argument("--policy-fixed-std", type=float, default=0.01)
+    retrain.add_argument("--actor-action-limit", type=float, default=1.0)
     args = parser.parse_args()
     if args.command == "check":
         check(args.gpu)
@@ -139,6 +179,8 @@ def main():
         if args.steps < 1:
             parser.error("steps must be positive")
         stage1(args)
+    elif args.command == "stage2-retrain":
+        stage2_retrain(args)
     elif args.command == "gripper-check":
         if not math.isfinite(args.seconds) or args.seconds <= 0:
             parser.error("seconds must be positive and finite")

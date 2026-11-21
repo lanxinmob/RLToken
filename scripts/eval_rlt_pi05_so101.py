@@ -494,7 +494,7 @@ def main():
         raise FileNotFoundError(f"Incomplete PI0.5 checkpoint: {pi05_path}")
     actor_checkpoint = torch.load(actor_path, map_location=device, weights_only=False)
     if (
-        actor_checkpoint.get("schema_version") != 3
+        actor_checkpoint.get("schema_version") not in (3, 4)
         or actor_checkpoint.get("actor_contract") != "paper_full_output_v1"
         or actor_checkpoint.get("rl_chunk_length") != 10
     ):

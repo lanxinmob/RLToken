@@ -1193,7 +1193,7 @@ def clamp_actor_action(action: torch.Tensor, limit: float) -> torch.Tensor:
     return action.clamp(min=-limit, max=limit)
 
 
-def sample_training_proposal(actor, batch, reference_dropout, actor_action_limit: float = 1.5):
+def sample_training_proposal(actor, batch, reference_dropout, actor_action_limit: float = 1.0):
     ref = batch["ref_chunk"]
     if reference_dropout > 0:
         drop = torch.rand(ref.shape[0], device=ref.device) < reference_dropout
@@ -2312,7 +2312,7 @@ def parse_args():
     parser.add_argument("--control_fps", type=float, default=10.0)
     parser.add_argument("--output_dir", type=str, default="checkpoints/rlt_stage2_pi05")
     parser.add_argument("--resume_from", type=str, default=None,
-                        help="Complete residual-actor Stage 2 checkpoint to resume into a new output directory")
+                        help="Complete full-output Stage 2 checkpoint to resume into a new output directory")
     parser.add_argument("--restore_replay", type=str, default=None,
                         help="Path to an existing replay_journal.pkl to restore into a NEW run "
                              "(fresh actor/critic weights, kept transitions; useful for retraining "
@@ -2326,7 +2326,7 @@ def parse_args():
                         help="Execute the actor's MEAN action deterministically (no Gaussian sampling). "
                              "Eliminates sampling jitter; the actor output then tracks its BC-anchored "
                              "mean (≈ reference) so execution is smooth like the VLA.")
-    parser.add_argument("--actor_action_limit", type=float, default=1.5,
+    parser.add_argument("--actor_action_limit", type=float, default=1.0,
                         help="Absolute normalized Actor output limit before execution and critic evaluation")
     parser.add_argument("--actor_gate_advantage", type=float, default=0.0,
                         help="Require batch-mean Q(actor)-Q(reference) to exceed this value before Actor execution")
@@ -2359,22 +2359,20 @@ def parse_args():
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--warmup_bc_weight", type=float, default=10.0,
                         help="BC regularization weight during learner warmup (anchors actor to reference)")
-    parser.add_argument("--warmup_q_weight", type=float, default=0.0,
-                        help="Q-maximization weight during learner warmup (0 = pure BC)")
+    parser.add_argument("--warmup_q_weight", type=float, default=1.0,
+                        help="Deprecated compatibility option; paper RLT uses a fixed unit Q coefficient")
     parser.add_argument("--online_bc_weight", type=float, default=10.0,
-                        help="BC regularization weight after learner warmup")
+                        help="beta in the paper Actor loss: -Q + beta * MSE(actor_action, replay reference)")
     parser.add_argument("--online_q_weight", type=float, default=1.0,
-                        help="Q-maximization weight after learner warmup")
+                        help="Deprecated compatibility option; paper RLT uses a fixed unit Q coefficient")
     parser.add_argument("--weight_anneal_updates", type=int, default=50_000,
                         help="Updates over which BC/Q weights interpolate from warmup_* to online_* values")
     parser.add_argument("--delta_weight", type=float, default=0.0,
                         help="Smoothness (delta) loss weight: penalizes the difference between the "
                              "actor's per-step action deltas and the reference/human action deltas "
                              "(computed in unnormalized degree space). 0 = paper-aligned RLT (no "
-                             "smoothness). Start at 0.02 for real-robot jitter reduction; the "
-                             "'delta' column in rl_metrics.log shows the raw delta penalty — aim "
-                             "for delta_weight*delta to stay below ~1/3 of the Q term "
-                             "(online_q_weight*actorQ) so RL is not suppressed.")
+                        "smoothness). Start at 0.02 only for a separate real-robot smoothness ablation; "
+                        "the 'delta' column in rl_metrics.log shows the raw delta penalty.")
     parser.add_argument("--learner_warmup_updates", type=int, default=0,
                         help="Optional extra pure-BC learner updates (0 matches paper Algorithm 1)")
     parser.add_argument("--policy_fixed_std", type=float, default=0.05)
@@ -2428,6 +2426,10 @@ def parse_args():
     # Intervention shaping is intentionally disabled in strict RL Token mode:
     # human corrections are demonstrations, not an extra reward source.
     parser.add_argument("--intervention_reward_bonus", type=float, default=0.0)
+    parser.add_argument("--td_target_min", type=float, default=0.0,
+                        help="Lower TD target bound for terminal 0/1 rewards")
+    parser.add_argument("--td_target_max", type=float, default=1.0,
+                        help="Upper TD target bound for terminal 0/1 rewards")
     config_probe = argparse.ArgumentParser(add_help=False)
     config_probe.add_argument("--config", type=str, default=None)
     config_args, _ = config_probe.parse_known_args()
@@ -2524,6 +2526,10 @@ def main():
         )
     if args.delta_weight < 0 or not math.isfinite(args.delta_weight):
         raise ValueError("--delta_weight must be >= 0 (0 = paper-aligned, no smoothness loss).")
+    if not math.isfinite(args.td_target_min) or not math.isfinite(args.td_target_max):
+        raise ValueError("--td_target_min and --td_target_max must be finite.")
+    if args.td_target_min > args.td_target_max:
+        raise ValueError("--td_target_min must not exceed --td_target_max.")
     if args.inference_only and not args.resume_from:
         raise ValueError("--inference_only requires --resume_from (a trained Stage 2 checkpoint to load the actor from).")
     if args.inference_only and args.vla_only:
@@ -2574,10 +2580,11 @@ def main():
     logger.info("  utd_ratio = %s | critic_per_actor = %s | batch_size = %s | buffer_capacity = %s",
                 args.utd_ratio, args.critic_per_actor, args.batch_size, args.buffer_capacity)
     logger.info("  policy_fixed_std = %s | reference_dropout = %s", args.policy_fixed_std, args.reference_dropout)
-    logger.info("  warmup: bc_weight = %s | q_weight = %s | learner_warmup_updates = %s",
-                args.warmup_bc_weight, args.warmup_q_weight, args.learner_warmup_updates)
-    logger.info("  online: bc_weight = %s | q_weight = %s | weight_anneal_updates = %s",
-                args.online_bc_weight, args.online_q_weight, args.weight_anneal_updates)
+    logger.info("  paper actor loss: q_coefficient = 1.0 | beta = %s | td_target = [%s, %s]",
+                args.online_bc_weight, args.td_target_min, args.td_target_max)
+    logger.info("  legacy weight options ignored: warmup_bc=%s warmup_q=%s online_q=%s anneal=%s learner_warmup=%s",
+                args.warmup_bc_weight, args.warmup_q_weight, args.online_q_weight,
+                args.weight_anneal_updates, args.learner_warmup_updates)
     logger.info("  actor_start_updates = %s | warmup_episodes = %s", args.actor_start_updates, args.warmup_episodes)
     logger.info("  actor net = %s x %s | critic net = %s x %s",
                 args.actor_hidden_dim, args.actor_num_layers, args.critic_hidden_dim, args.critic_num_layers)
@@ -2974,7 +2981,7 @@ def main():
             critic_optimizer.load_state_dict(resume_checkpoint["critic_optimizer"])
         move_optimizer_state_to_device(actor_optimizer, device)
         move_optimizer_state_to_device(critic_optimizer, device)
-        logger.info("Loaded residual Stage 2 checkpoint from %s", args.resume_from)
+        logger.info("Loaded full-output Stage 2 checkpoint from %s", args.resume_from)
 
     actor_params = sum(p.numel() for p in actor.parameters())
     critic_params = sum(p.numel() for p in critic.parameters())
@@ -3868,25 +3875,10 @@ def main():
                     k: v.to(device) for k, v in replay.sample_batch(args.batch_size).items()
                 }
 
-                schedule_updates = aligned_critic_updates if action_transform is not None else total_updates
-                if schedule_updates < args.learner_warmup_updates:
-                    weight_progress = 0.0
-                elif args.weight_anneal_updates == 0:
-                    weight_progress = 1.0
-                else:
-                    weight_progress = min(
-                        1.0,
-                        max(0.0, (schedule_updates - args.learner_warmup_updates)
-                            / args.weight_anneal_updates),
-                    )
-                bc_weight = (
-                    args.warmup_bc_weight
-                    + weight_progress * (args.online_bc_weight - args.warmup_bc_weight)
-                )
-                q_weight = (
-                    args.warmup_q_weight
-                    + weight_progress * (args.online_q_weight - args.warmup_q_weight)
-                )
+                # Paper RLT uses one fixed beta and a unit Q coefficient. The
+                # rollout warmup fills replay before learning starts, while
+                # the Actor objective itself remains -Q + beta * BC.
+                bc_weight = args.online_bc_weight
                 delta_weight = args.delta_weight
                 # Populated only on actor-update steps; NaN elsewhere in the log.
                 actor_q: torch.Tensor | None = None
@@ -3931,11 +3923,15 @@ def main():
                         chunk_return
                         + bootstrap_discount * (1.0 - batch["done"]) * target_q
                     )
-                    # Stability guardrail: rewards are terminal 0/1, so the true
-                    # Q range is ~[-1, 1]; clip the TD target so a diverging
-                    # target critic can never bootstrap Q values into the
-                    # hundreds (deadly-triad overestimation spiral).
-                    td_target = td_target.clamp(min=-2.0, max=2.0)
+                    # The configured reward contract is terminal 0/1 only, so
+                    # every discounted return is bounded by this interval.
+                    # Keeping the bound at the TD target prevents a shared
+                    # twin-critic error from bootstrapping outside the reward
+                    # scale while preserving the paper's TD backup.
+                    td_target = td_target.clamp(
+                        min=args.td_target_min,
+                        max=args.td_target_max,
+                    )
                 q1, q2 = critic(
                     batch["z_rl"], critic_proprio(batch), batch["action_chunk"]
                 )
@@ -4002,16 +3998,13 @@ def main():
                     action_mean, sampled_action = sample_training_proposal(
                         actor, bc_batch, args.reference_dropout, args.actor_action_limit,
                     )
-                    source_chunk = bc_batch["source_chunk"]
-                    human_mask = (
-                        (source_chunk == int(TransitionSource.HUMAN))
-                        | (source_chunk == int(TransitionSource.MIXED))
-                    )
                     valid_mask_f = bc_batch["valid_mask"].float()
 
-                    bc_target = torch.where(
-                        human_mask.unsqueeze(-1), bc_batch["requested_chunk"], bc_batch["reference_targets"]
-                    )
+                    # Human interventions replace the stored reference during
+                    # replay materialization. Using reference_targets here
+                    # gives the paper objective for both VLA and intervention
+                    # rows without a second source-dependent BC objective.
+                    bc_target = bc_batch["reference_targets"]
                     prepared_sample = timeline.prepare(
                         sampled_action, batch_preparation(bc_batch), execution_scale=args.actor_execution_scale,
                         actor=True,
@@ -4036,12 +4029,15 @@ def main():
 
                     actor_loss = (
                         bc_weight * bc_penalty
-                        - q_weight * sampled_actor_q
+                        - sampled_actor_q
                         + delta_weight * delta_penalty
                     )
 
                     actor_optimizer.zero_grad(set_to_none=True)
                     actor_loss.backward()
+                    # Match the offline learner and keep a single noisy Q
+                    # batch from producing a large policy step.
+                    torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=10.0)
                     actor_optimizer.step()
                     actor_updates += 1
 
