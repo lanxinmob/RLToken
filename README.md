@@ -90,6 +90,20 @@ Actor 的网络均值为 `VLA参考 + scale * tanh(残差网络输出)`。最后
 `-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`）。
 重训将 checkpoint 和 replay journal 写入新目录。用 `--actor-residual-scale 0` 可训练原全量输出 Actor。
 
+离线日志按 Critic 更新次数记录训练 batch 的指标。用下面的命令生成交互曲线，包括实际 Actor loss、双 Critic 的 TD 均方误差之和、行为克隆 MSE，以及同一 batch 上 Actor 均值动作与 VLA 动作的 Q 值差。
+
+```bash
+RUN=outputs/rlt/YOUR_RETRAIN_RUN
+.venv/bin/python scripts/plot_rl_metrics.py "$RUN/offline_metrics.jsonl" --out "$RUN/rl_losses_history.html"
+```
+
+冻结权重在 ARX 上评估时，`--episodes` 沿用总回合编号。下面从第 200 回合 checkpoint 开始测 10 回合，沿用采集时的起步过渡和 RTC 参数。自动 critical 开启后，Actor 默认获准在关键阶段执行。每回合按 `f` 结束、用 `y/n` 评分，评估目录的 `training_log.json` 在 `inference_scores` 中单独保存这次的结果。
+
+```bash
+./rlt stage2 --eval-only --auto-critical --actor-execute-mean --episodes 210 \
+  --resume-from "$RUN/final_checkpoint.pt" --start-blend-steps 3 --rtc-max-guidance-weight 8
+```
+
 单臂 X5_umi 的默认夹爪速度采用 SDK 原生值 0.30 m/s，30 Hz 下每条夹爪指令最多移动 10 mm。
 从旧 checkpoint 对照试验时，`--gripper-speed` 指定离线训练模拟的有效夹爪速度（m/s），
 省略时沿用采集时的值。历史 replay 中的动作和奖励保留采集时的记录。上机时执行速度取自

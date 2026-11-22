@@ -551,6 +551,8 @@ def run(args):
                "--output_dir", str(args.output.resolve()), "--max_episodes", str(args.episodes)]
     if args.dry_run:
         command.append("--dry_run")
+    if getattr(args, "eval_only", False):
+        command.extend(["--inference_only", "--inference_score"])
     if getattr(args, "resume_from", None) is not None:
         command.extend(["--resume_from", str(args.resume_from.resolve())])
     if getattr(args, "resume_actor_residual_scale", None) is not None:

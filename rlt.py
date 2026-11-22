@@ -161,6 +161,8 @@ def main():
             online.add_argument("--output", type=Path, default=OUTPUT / f"stage2_arx_{datetime.now():%Y%m%d_%H%M%S}")
             online.add_argument("--dry-run", action="store_true")
             online.add_argument("--resume-from", type=Path)
+            online.add_argument("--eval-only", action="store_true",
+                                help="Evaluate the frozen checkpoint and score each new episode (y/n)")
             online.add_argument("--actor-residual-step", type=float,
                                 help="Maximum normalized residual change per issued command")
             online.add_argument("--resume-actor-residual-scale", type=float,
@@ -258,7 +260,7 @@ def main():
                 print(f"Stage 2 exited with status {exc.returncode}", file=sys.stderr)
                 raise SystemExit(exc.returncode if exc.returncode >= 0 else 128 - exc.returncode)
             finally:
-                if not args.dry_run and not args.vla_only:
+                if not (args.dry_run or args.vla_only or args.eval_only):
                     print_stage2_resume(args, sys.argv[2:])
 
 

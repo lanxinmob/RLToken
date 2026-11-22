@@ -6294,7 +6294,14 @@ def main():
                 "critic_updates": critic_updates,
                 "actor_updates": actor_updates,
                 "aligned_critic_updates": aligned_critic_updates,
+                **({"inference_scores": inference_scores} if args.inference_only else {}),
             }, f, indent=2)
+
+        if args.inference_only:
+            result = f"Evaluation complete. Scored successes: {sum(inference_scores)}/{len(inference_scores)}."
+            logger.info(result)
+            print(result, flush=True)
+            return
 
         total_episodes = len(episode_rewards)
         total_interventions = sum(episode_interventions)
