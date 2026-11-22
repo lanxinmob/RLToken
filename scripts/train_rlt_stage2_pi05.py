@@ -3951,6 +3951,10 @@ def main():
         # Non-finite values (no data) are written as empty strings instead of nan so
         # the TSV curves stay parseable.
         metrics_log_path = Path(args.metrics_log) if args.metrics_log else output_dir / "rl_metrics.log"
+        # Keep exact loss values in a separate append-only stream.  A separate
+        # file lets resumed runs continue safely when an older metrics log has
+        # the pre-loss column layout.
+        losses_log_path = output_dir / "rl_losses.log"
         metrics_log_lock = threading.Lock()
 
         def append_metrics_line(line: str) -> None:
@@ -3962,6 +3966,15 @@ def main():
             except OSError as _exc:
                 logger.warning("Metrics log write failed: %s", _exc)
 
+        def append_losses_line(line: str) -> None:
+            try:
+                with metrics_log_lock:
+                    with open(losses_log_path, "a", encoding="utf-8") as _f:
+                        _f.write(line + "\n")
+                        _f.flush()
+            except OSError as _exc:
+                logger.warning("Loss metrics log write failed: %s", _exc)
+
         try:
             if not metrics_log_path.exists() or metrics_log_path.stat().st_size == 0:
                 append_metrics_line(
@@ -3969,6 +3982,14 @@ def main():
                     "q2_mean\tq2_max\ttd_mean\ttd_max\ttd_err\tactorQ\treferenceQ\tactorAdv\t"
                     "bc\tdelta\tn_rew\tn_done\tactor_on\t"
                     "aligned_critic_updates\texecution_replay"
+                )
+        except OSError:
+            pass
+        try:
+            if not losses_log_path.exists() or losses_log_path.stat().st_size == 0:
+                append_losses_line(
+                    "# updates\tepisode\tbuffer\tcritic_loss\tactor_loss\t"
+                    "actor_q_sample\tactor_q\treference_q\tbc_loss\tdelta_loss"
                 )
         except OSError:
             pass
@@ -4003,6 +4024,13 @@ def main():
                 f"{_fmt_metric(mean('bc'), 5)}\t{_fmt_metric(mean('delta'), 5)}\t"
                 f"{_fmt_metric(mean('n_rew'), 2)}\t{_fmt_metric(mean('n_done'), 2)}\t"
                 f"{last_actor_active}\t{aligned_critic_updates}\t{buffer.stats()['execution_entries']}"
+            )
+            append_losses_line(
+                f"{total_updates}\t{completed_episode + 1}\t{len(buffer)}\t"
+                f"{_fmt_metric(mean('critic_loss'), 7)}\t{_fmt_metric(mean('actor_loss'), 7)}\t"
+                f"{_fmt_metric(mean('actor_q_sample'))}\t{_fmt_metric(mean('actorQ'))}\t"
+                f"{_fmt_metric(mean('referenceQ'))}\t{_fmt_metric(mean('bc'), 7)}\t"
+                f"{_fmt_metric(mean('delta'), 7)}"
             )
         if resume_checkpoint is not None:
             if args.max_episodes < start_episode - 1:
@@ -4251,9 +4279,12 @@ def main():
                     "td_mean": float(td_target.mean()),
                     "td_max": float(td_target.max()),
                     "td_err": float(critic_loss.detach()),
+                    "critic_loss": float(critic_loss.detach()),
                     "actorQ": float(actor_q.detach()) if actor_q is not None else float("nan"),
                     "referenceQ": float(reference_q.detach()) if actor_q is not None else float("nan"),
                     "actorAdv": float(actor_advantage.detach()) if actor_q is not None else float("nan"),
+                    "actor_loss": float(actor_loss.detach()) if actor_q is not None else float("nan"),
+                    "actor_q_sample": float(sampled_actor_q.detach()) if actor_q is not None else float("nan"),
                     "bc": float(bc_penalty.detach()) if bc_penalty is not None else float("nan"),
                     "delta": float(delta_penalty.detach()) if delta_penalty is not None else float("nan"),
                     "n_rew": float(n_rew),
@@ -4270,6 +4301,9 @@ def main():
                         "observation.rlt/q1_mean": latest["q1_mean"],
                         "observation.rlt/q2_mean": latest["q2_mean"],
                         "observation.rlt/td_error": latest["td_err"],
+                        "observation.rlt/critic_loss": latest["critic_loss"],
+                        "observation.rlt/actor_loss": latest["actor_loss"] if math.isfinite(latest["actor_loss"]) else None,
+                        "observation.rlt/actor_q_sample": latest["actor_q_sample"] if math.isfinite(latest["actor_q_sample"]) else None,
                         "observation.rlt/actor_q": latest["actorQ"] if math.isfinite(latest["actorQ"]) else None,
                         "observation.rlt/reference_q": latest["referenceQ"] if math.isfinite(latest["referenceQ"]) else None,
                         "observation.rlt/actor_advantage": latest["actorAdv"] if math.isfinite(latest["actorAdv"]) else None,

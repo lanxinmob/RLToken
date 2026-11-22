@@ -61,7 +61,7 @@ ARX 在线训练每次启动或续训都由 VLA 执行。进入关键阶段后�
 Viewer 中的 `Live camera` 显示腕部相机，`Joint targets (deg)` 同时显示 VLA、Actor
 选中值和 SDK 接受值，`Measured vs accepted (deg)` 显示实际关节状态与发送目标，
 `Joint target error (deg)` 显示 `selected-vla` 和 `accepted-selected`，其余视图显示夹爪、
-控制来源、关键阶段、更新次数、Q 值、TD error、BC loss、Actor advantage 和 shadow 指标。
+控制来源、关键阶段、更新次数、Q 值、Critic loss、Actor loss、TD error、BC loss、Actor advantage 和 shadow 指标。
 ARX 记录将弧度/米转换为度/毫米，SO-101 记录保留度数。相机、目标和指标使用同一条
 `control` 时间线，拖动时间轴即可逐步对齐动作与画面。
 
@@ -475,6 +475,7 @@ python scripts/train_rlt_stage2_pi05.py --config configs/stage2_pi05.json
 控制台只输出回合计数与必要提示，完整日志写入 `<output_dir>/train.log`，每个回合的指标记录在
 `rl_metrics.log`，可以使用 `python scripts/plot_rl_metrics.py <日志路径> --live --port 8000`
 查看训练曲线。
+精确的 Critic loss、Actor loss 和 Actor 采样 Q 另写入 `<output_dir>/rl_losses.log`，可用同一脚本打开该文件生成损失曲线。
 
 <p align="center">
   <img src="assets/rl_training_curves.png" alt="在线 RL 训练曲线" width="780">
