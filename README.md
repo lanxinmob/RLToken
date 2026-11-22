@@ -72,6 +72,11 @@ Actor 的网络均值为 `VLA参考 + scale * tanh(残差网络输出)`。最后
 `-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`）。
 重训将 checkpoint 和 replay journal 写入新目录。用 `--actor-residual-scale 0` 可训练原全量输出 Actor。
 
+在线训练的 replay batch 固定由 30% warmup/offline 数据和 70% online/HIL 数据组成。
+warmup/offline 池均匀采样。online/HIL 池按新旧 transition 的插入年龄衰减，并结合每条数据已经被采样的次数做平衡，
+同时保留 20% 的均匀概率下限，旧数据不会被永久饿死。采样计数随 checkpoint 保存并在续训时恢复。
+默认衰减常数为 2000 条 transition，参数为 `replay_online_decay_steps`。
+
 从训练结果继续在线采集时，Stage 2 从 checkpoint 读取 Actor 类型和残差上限。
 用 `--actor-execute-mean` 可直接评估均值，去除固定标准差的探索采样。下面的起步步数 3 对应已有 beta10 回放。
 
@@ -474,6 +479,9 @@ python scripts/infer_rlt_stage2_pi05.py --config configs/infer_pi05.json
 | `cameras`、`camera_map` | 相机设备及其对应的模型输入 |
 | `control_fps`、`steps_per_episode`、`max_episodes` | 回合节奏 |
 | `warmup_episodes` | Actor 启动前的纯 VLA 预热回合数，建议大于 15 |
+| `replay_warmup_ratio` | 每个在线 replay batch 中 warmup/offline 数据的比例，默认 `0.3`，其余为 online/HIL |
+| `replay_online_decay_steps` | online/HIL 数据的插入年龄衰减常数，默认 `2000` 条 transition |
+| `replay_online_uniform_floor` | online/HIL 池的均匀概率下限，默认 `0.2` |
 | `output_dir` | 输出目录，新实验需要空目录 |
 | `resume_from` | 续训时指向既有 checkpoint，留空表示新训练（仅训练配置） |
 | `dry_run` | 首次运行必须为 `true` |

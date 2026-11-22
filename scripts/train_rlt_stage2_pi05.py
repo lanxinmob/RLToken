@@ -1239,18 +1239,35 @@ class ReplayBuffer:
         recent_online_ratio: float = 0.4,
         warmup_demo_ratio: float = 0.3,
         human_intervention_ratio: float = 0.2,
+        online_warmup_ratio: float = 0.3,
+        online_recency_tau: float = 2000.0,
+        online_uniform_floor: float = 0.2,
     ):
+        if capacity <= 0:
+            raise ValueError("Replay capacity must be positive")
+        if not 0.0 <= online_warmup_ratio <= 1.0:
+            raise ValueError("online_warmup_ratio must be in [0, 1]")
+        if not math.isfinite(online_recency_tau) or online_recency_tau <= 0:
+            raise ValueError("online_recency_tau must be finite and positive")
+        if not 0.0 <= online_uniform_floor <= 1.0:
+            raise ValueError("online_uniform_floor must be in [0, 1]")
         self.capacity = capacity
         self._sample_strategy = sample_strategy
         self._recent_episode_window = recent_episode_window
         self._recent_online_ratio = recent_online_ratio
         self._warmup_demo_ratio = warmup_demo_ratio
         self._human_intervention_ratio = human_intervention_ratio
+        self._online_warmup_ratio = online_warmup_ratio
+        self._online_recency_tau = float(online_recency_tau)
+        self._online_uniform_floor = float(online_uniform_floor)
         self._storage: dict[str, np.ndarray] | None = None
         self._position = 0
         self._size = 0
         self._lock = threading.Lock()
         self._rng = np.random.default_rng(seed)
+        self._sample_counts = np.zeros(capacity, dtype=np.int64)
+        self._insertion_order = np.zeros(capacity, dtype=np.int64)
+        self._next_insertion_order = 0
 
     def _initialize_storage(self, record: dict[str, np.ndarray]) -> None:
         self._storage = {}
@@ -1268,6 +1285,9 @@ class ReplayBuffer:
                 if value.shape != expected:
                     raise ValueError(f"{key} shape {value.shape} != expected {expected}")
                 self._storage[key][self._position] = value
+            self._sample_counts[self._position] = 0
+            self._insertion_order[self._position] = self._next_insertion_order
+            self._next_insertion_order += 1
             self._position = (self._position + 1) % self.capacity
             self._size = min(self._size + 1, self.capacity)
 
@@ -1276,15 +1296,18 @@ class ReplayBuffer:
             batch_size = min(batch_size, self._size)
             if batch_size == 0:
                 return {}
-            if require_execution_state:
-                eligible = np.flatnonzero(self._execution_eligible())
-                if eligible.size < batch_size:
-                    return {}
+            eligible = np.flatnonzero(self._execution_eligible()) if require_execution_state else None
+            if require_execution_state and eligible.size < batch_size:
+                return {}
+            if self._sample_strategy == "offline_online_balanced":
+                indices = self._sample_offline_online_indices(batch_size, eligible)
+            elif require_execution_state:
                 indices = self._rng.choice(eligible, size=batch_size, replace=True)
             elif self._sample_strategy == "stratified":
                 indices = self._sample_stratified_indices(batch_size)
             else:
                 indices = self._sample_uniform_indices(batch_size)
+            np.add.at(self._sample_counts, indices, 1)
             raw = {k: v[indices].copy() for k, v in self._storage.items()}
         result = {}
         for k, v in raw.items():
@@ -1307,6 +1330,107 @@ class ReplayBuffer:
 
     def _sample_uniform_indices(self, batch_size: int) -> np.ndarray:
         return self._rng.integers(0, self._size, size=batch_size)
+
+    def _sample_offline_online_indices(
+        self,
+        batch_size: int,
+        eligible: np.ndarray | None,
+    ) -> np.ndarray:
+        """Sample a fixed warmup/online mix while preventing online starvation.
+
+        Warmup rows are sampled uniformly. Online rows use an age decay and a
+        count correction. The uniform floor keeps older rows from losing all
+        probability within their current least-used count tier. Sampling
+        without replacement within a batch makes the count correction meaningful.
+        """
+        candidates = np.arange(self._size, dtype=np.int64) if eligible is None else eligible
+        phase = self._storage["collection_phase_id"][:self._size]
+        # Unknown phase rows are treated as offline/warmup. They predate the
+        # online phase marker and should not consume the online/HIL quota.
+        warmup = candidates[phase[candidates] != COLLECTION_PHASE_ONLINE]
+        online = candidates[phase[candidates] == COLLECTION_PHASE_ONLINE]
+        warmup_target = int(round(batch_size * self._online_warmup_ratio))
+        online_target = batch_size - warmup_target
+
+        selected_warmup = self._sample_uniform_pool(warmup, min(warmup_target, warmup.size))
+        selected_online = self._sample_online_pool(online, min(online_target, online.size))
+        selected = [selected_warmup, selected_online]
+
+        selected_count = sum(part.size for part in selected)
+        if selected_count < batch_size:
+            chosen = np.concatenate([part for part in selected if part.size], dtype=np.int64) \
+                if selected_count else np.empty(0, dtype=np.int64)
+            available = np.ones(candidates.size, dtype=bool)
+            if chosen.size:
+                available[np.searchsorted(candidates, chosen)] = False
+            remaining = candidates[available]
+            # Prefer online rows when warmup is unavailable, then fill from
+            # warmup. This preserves the 70% online target whenever possible.
+            extra_online = remaining[phase[remaining] == COLLECTION_PHASE_ONLINE]
+            extra_warmup = remaining[phase[remaining] != COLLECTION_PHASE_ONLINE]
+            extra = self._sample_online_pool(extra_online, min(batch_size - selected_count, extra_online.size))
+            selected.append(extra)
+            selected_count += extra.size
+            if selected_count < batch_size:
+                extra = self._sample_uniform_pool(
+                    extra_warmup, min(batch_size - selected_count, extra_warmup.size)
+                )
+                selected.append(extra)
+                selected_count += extra.size
+
+        result = np.concatenate([part for part in selected if part.size], dtype=np.int64)
+        if result.size < batch_size:
+            # This path is only reachable when the caller supplied fewer than
+            # batch_size eligible rows. Keep the historical replacement behavior
+            # for non-execution sampling instead of returning a short batch.
+            pool = candidates if candidates.size else np.empty(0, dtype=np.int64)
+            if pool.size:
+                result = np.concatenate([
+                    result,
+                    self._rng.choice(pool, size=batch_size - result.size, replace=True),
+                ])
+        self._rng.shuffle(result)
+        return result[:batch_size]
+
+    def _sample_uniform_pool(self, pool: np.ndarray, count: int) -> np.ndarray:
+        if count <= 0 or pool.size == 0:
+            return np.empty(0, dtype=np.int64)
+        return self._rng.choice(pool, size=count, replace=False)
+
+    def _sample_online_pool(self, pool: np.ndarray, count: int) -> np.ndarray:
+        if count <= 0 or pool.size == 0:
+            return np.empty(0, dtype=np.int64)
+        if count >= pool.size:
+            return pool.copy()
+
+        counts = self._sample_counts[pool].astype(np.float64)
+        # Always consume the least-used count tier first. Recency only breaks
+        # ties, so online rows cannot be permanently starved by the age decay.
+        threshold = np.partition(counts, count - 1)[count - 1]
+        lower = counts < threshold
+        selected = pool[lower]
+        remaining = count - selected.size
+        if remaining <= 0:
+            return selected[:count]
+        ties = pool[counts == threshold]
+        age = self._next_insertion_order - self._insertion_order[ties] - 1
+        age = np.maximum(age, 0.0)
+        recency = np.exp(-age / self._online_recency_tau)
+        recency_sum = recency.sum()
+        if not math.isfinite(float(recency_sum)) or recency_sum <= 0:
+            recency = np.ones(ties.size, dtype=np.float64)
+            recency_sum = float(ties.size)
+        recency /= recency_sum
+        weights = (
+            self._online_uniform_floor / ties.size
+            + (1.0 - self._online_uniform_floor) * recency
+        )
+        # Gumbel top-k is weighted sampling without replacement. It avoids
+        # repeated rows in a batch while preserving the requested probabilities.
+        scores = np.log(np.maximum(weights, np.finfo(np.float64).tiny))
+        scores += self._rng.gumbel(size=ties.size)
+        chosen = np.argpartition(scores, -remaining)[-remaining:]
+        return np.concatenate([selected, ties[chosen]], dtype=np.int64)
 
     def _sample_stratified_indices(self, batch_size: int) -> np.ndarray:
         phase = self._storage["collection_phase_id"][:self._size]
@@ -1369,6 +1493,8 @@ class ReplayBuffer:
         ))
 
     def stats(self) -> dict:
+        counts = self._sample_counts[:self._size]
+        phase = self._storage["collection_phase_id"][:self._size] if self._storage is not None else np.empty(0)
         return {
             "capacity": self.capacity,
             "size": self._size,
@@ -1376,7 +1502,29 @@ class ReplayBuffer:
             "sample_strategy": self._sample_strategy,
             "intervention_count": self.intervention_count,
             "execution_entries": int(self._execution_eligible().sum()),
+            "warmup_entries": int(np.sum(phase != COLLECTION_PHASE_ONLINE)),
+            "online_entries": int(np.sum(phase == COLLECTION_PHASE_ONLINE)),
+            "sample_count_min": int(counts.min()) if counts.size else 0,
+            "sample_count_max": int(counts.max()) if counts.size else 0,
+            "sample_count_mean": float(counts.mean()) if counts.size else 0.0,
         }
+
+    def sample_counts_snapshot(self) -> np.ndarray:
+        with self._lock:
+            return self._sample_counts.copy()
+
+    def restore_sample_counts(self, counts: np.ndarray) -> None:
+        values = np.asarray(counts, dtype=np.int64)
+        with self._lock:
+            if values.shape != self._sample_counts.shape:
+                logger.warning(
+                    "Ignoring replay sample counts with capacity %s; current buffer capacity is %s.",
+                    values.shape, self._sample_counts.shape,
+                )
+                return
+            if np.any(values < 0):
+                raise ValueError("Replay sample-count state cannot contain negative values")
+            self._sample_counts[:] = values
 
     def __len__(self):
         return self._size
@@ -2417,6 +2565,12 @@ def parse_args():
                         help="Leader mirror holding torque as a fraction of max (0-1). Lower = the "
                              "leader yields to a human more easily (easier HIL takeover).")
     parser.add_argument("--buffer_capacity", type=int, default=100_000)
+    parser.add_argument("--replay_warmup_ratio", type=float, default=0.30,
+                        help="Fraction of each online replay batch reserved for uniform warmup/offline rows")
+    parser.add_argument("--replay_online_decay_steps", type=float, default=2000.0,
+                        help="Exponential age-decay constant for online replay rows, in inserted transitions")
+    parser.add_argument("--replay_online_uniform_floor", type=float, default=0.20,
+                        help="Uniform probability floor inside the online replay sampler")
     parser.add_argument("--save_every", type=int, default=20)
     parser.add_argument("--metrics_log", type=str, default=None,
                         help="Path to a tail-friendly RL metrics log (default: <output_dir>/rl_metrics.log). "
@@ -2592,6 +2746,12 @@ def main():
     logger.info("  actor_residual_scale = %s | delta_weight = %s | intervention_reward_bonus = %s | seed = %s",
                 args.actor_residual_scale, args.delta_weight, args.intervention_reward_bonus, args.seed)
     logger.info("  save_every = %s | replay_stride = 2 | n_action_steps_rl = 10", args.save_every)
+    logger.info(
+        "  replay sampler = %.0f%% warmup/offline uniform + %.0f%% online/HIL age-balanced "
+        "| decay_steps = %s | uniform_floor = %.2f",
+        args.replay_warmup_ratio * 100.0, (1.0 - args.replay_warmup_ratio) * 100.0,
+        args.replay_online_decay_steps, args.replay_online_uniform_floor,
+    )
     logger.info("Safety / HIL:")
     logger.info("  dry_run         = %s | max_relative_target = %s",
                 args.dry_run, args.max_relative_target if args.max_relative_target else "disabled")
@@ -2747,6 +2907,12 @@ def main():
         raise ValueError("--auto_critical_override_cooldown cannot be negative.")
     if args.policy_fixed_std <= 0 or not math.isfinite(args.policy_fixed_std):
         raise ValueError("--policy_fixed_std must be finite and positive.")
+    if not 0.0 <= args.replay_warmup_ratio <= 1.0:
+        raise ValueError("--replay_warmup_ratio must be in [0, 1].")
+    if args.replay_online_decay_steps <= 0 or not math.isfinite(args.replay_online_decay_steps):
+        raise ValueError("--replay_online_decay_steps must be finite and positive.")
+    if not 0.0 <= args.replay_online_uniform_floor <= 1.0:
+        raise ValueError("--replay_online_uniform_floor must be in [0, 1].")
     if args.chunk_smooth_taps < 0 or (args.chunk_smooth_taps > 1 and args.chunk_smooth_taps % 2 == 0):
         raise ValueError("--chunk_smooth_taps must be 0, 1 or an odd number of taps.")
     if args.learner_warmup_updates < 0:
@@ -2997,11 +3163,14 @@ def main():
     buffer = ReplayBuffer(
         args.buffer_capacity,
         seed=args.seed,
-        sample_strategy="uniform",
+        sample_strategy="offline_online_balanced",
         recent_episode_window=20,
         recent_online_ratio=0.4,
         warmup_demo_ratio=0.3,
         human_intervention_ratio=0.2,
+        online_warmup_ratio=args.replay_warmup_ratio,
+        online_recency_tau=args.replay_online_decay_steps,
+        online_uniform_floor=args.replay_online_uniform_floor,
     )
     # "" / whitespace in a config means "disabled" (same as null), NOT "path '.'".
     restore_replay = args.restore_replay.strip() if isinstance(args.restore_replay, str) else args.restore_replay
@@ -3033,6 +3202,17 @@ def main():
                 f"(journal_bytes={resume_checkpoint['replay_journal_bytes']}); "
                 f"journal file: {replay._journal_path}."
             )
+        saved_sample_counts = resume_checkpoint.get("replay_sample_counts")
+        if saved_sample_counts is not None:
+            buffer.restore_sample_counts(saved_sample_counts)
+            logger.info(
+                "Restored replay sample counts: min=%d max=%d mean=%.1f",
+                buffer.stats()["sample_count_min"],
+                buffer.stats()["sample_count_max"],
+                buffer.stats()["sample_count_mean"],
+            )
+        else:
+            logger.info("Resume checkpoint has no replay sample counts; starting the sampler counts at zero.")
         buffer._rng.bit_generator.state = resume_checkpoint["replay_rng_state"]
     if replay is not None:
         logger.info("Replay buffer: capacity=%s, journal=%s", args.buffer_capacity, replay._journal_path)
@@ -3646,6 +3826,7 @@ def main():
                     runtime_provenance=runtime_provenance,
                     rng_state=capture_rng_state(),
                     replay_rng_state=copy.deepcopy(buffer._rng.bit_generator.state),
+                    replay_sample_counts=buffer.sample_counts_snapshot(),
                     replay_journal_bytes=journal_bytes,
                     replay_entries=replay.stats()["adds_total"],
                 )
