@@ -178,6 +178,28 @@ def parse_log(path: Path):
     """Auto-detect and parse a log file. Returns a dict, or None."""
     if not path.exists():
         return None
+    if path.name == "offline_metrics.jsonl":
+        labels = {"actor_loss": "Actor loss", "critic_loss": "Twin Critic loss", "bc": "BC MSE"}
+        advantage = "Q(Actor mean) - Q(VLA)"
+        series = {name: [] for name in [*labels.values(), advantage]}
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    if line.endswith("\n"):
+                        raise
+                    break  # A live writer may still be appending this row.
+                x = row["critic_updates"]
+                for key, label in labels.items():
+                    series[label].append((x, _to_float(row.get(key))))
+                actor_q, ref_q = row["actor_q"], row["reference_q"]
+                gap = actor_q - ref_q if actor_q is not None and ref_q is not None else None
+                series[advantage].append((x, gap))
+        if not series[advantage]:
+            return None
+        return {"mode": "Stage 2 offline replay", "x_name": "Critic updates", "series": series,
+                "rows": len(series[advantage]), "path": str(path)}
     # 1) loss_history.json
     if path.name == "loss_history.json" or path.suffix == ".json":
         r = parse_loss_json(path)
@@ -270,7 +292,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   select:hover, button:hover { border-color: #38bdf8; }
   .stat { font-size: 0.8em; color: #7dd3fc; }
   .stat b { color: #e2e8f0; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr)); gap: 14px; }
   .card { background: #111c30; border: 1px solid #1e2a44; border-radius: 12px; padding: 10px 12px 6px; }
   .card-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
   .m-name { font-size: 0.85em; font-weight: 600; color: #e2e8f0; }
@@ -311,7 +333,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button id="csv-btn">Export CSV</button>
   <span class="stat">curves: <b id="n-series">0</b> · latest x: <b id="last-x">-</b></span>
 </div>
-<div class="sub" style="margin-top:0">Light-blue bands = RL Actor intervention periods (actor_on=1 ranges, i.e. episodes in which the Actor took over execution)</div>
+<div id="actor-note" class="sub" style="margin-top:0">Light-blue bands = RL Actor intervention periods (actor_on=1 ranges, i.e. episodes in which the Actor took over execution)</div>
 
 <div class="grid" id="grid"></div>
 <div id="toast">CSV exported</div>
@@ -396,6 +418,7 @@ function drawChart(canvas, xs, ys, opt) {
   for (const [x] of all) { xMin = Math.min(xMin, x); xMax = Math.max(xMax, x); }
   const xr = (xMax - xMin) || 1;
   const X = (x) => padL + ((x - xMin) / xr) * pw;
+  canvas.chartBounds = {left: padL, width: pw, xMin, xr};
 
   // Intervention band highlight: light-blue vertical band + boundary lines
   if (opt.bands && opt.bands.length) {
@@ -491,6 +514,8 @@ function render(force) {
 
   // actor_on gets no card of its own; it only defines the intervention bands
   const actSeries = DATA.series["actor_on"] || [];
+  document.getElementById("actorfilter").parentElement.style.display = actSeries.length ? "" : "none";
+  document.getElementById("actor-note").hidden = !actSeries.length;
   const names = Object.keys(DATA.series).filter(n => n !== "actor_on");
   document.getElementById("n-series").textContent = names.length;
   document.getElementById("n-rows").textContent = DATA.rows;
@@ -557,17 +582,18 @@ function render(force) {
 function bindTip(canvas, xs, ys, name) {
   const tip = document.getElementById("tip");
   const onMove = (e) => {
-    const rect = canvas.getBoundingClientRect();
-    const xPix = e.clientX - rect.left;
+    const bounds = canvas.chartBounds;
+    if (!bounds) return;
+    const xPix = e.clientX - canvas.getBoundingClientRect().left - bounds.left;
     // Map the linear X pixel back to an index
     let best = -1, bestD = Infinity;
     for (let i = 0; i < xs.length; i++) {
-      if (xs[i] === null) continue;
-      const frac = (xs[i] - (DATA.xMin ?? 0)) / ((DATA.xSpan ?? 1) || 1);
-      const d = Math.abs(frac * rect.width - xPix);
+      if (xs[i] === null || ys[i] === null) continue;
+      const frac = (xs[i] - bounds.xMin) / bounds.xr;
+      const d = Math.abs(frac * bounds.width - xPix);
       if (d < bestD) { bestD = d; best = i; }
     }
-    if (best < 0 || bestD > rect.width / 30) { tip.style.display = "none"; return; }
+    if (best < 0 || bestD > bounds.width / 30) { tip.style.display = "none"; return; }
     tip.style.display = "block";
     tip.style.left = (e.clientX + 12) + "px";
     tip.style.top = (e.clientY - 8) + "px";
@@ -619,7 +645,7 @@ function loadData(cb) {
 document.getElementById("smooth").addEventListener("change", () => render(false));
 document.getElementById("actorfilter").addEventListener("change", () => render(false));
 document.getElementById("logscale").addEventListener("change", () => render(false));
-document.getElementById("grid").addEventListener("change", () => render(false));
+document.getElementById("grid-toggle").addEventListener("change", () => render(false));
 document.getElementById("csv-btn").addEventListener("click", exportCSV);
 
 loadData(() => {
@@ -629,15 +655,6 @@ loadData(() => {
     setInterval(() => loadData(() => render(false)), (window.__LIVE_SEC__ || 3) * 1000);
   }
   if (hasSeries) {
-    // Precompute the X range for the tooltip
-    let xMin = Infinity, xMax = -Infinity;
-    for (const n of Object.keys(DATA.series)) {
-      for (const [x] of DATA.series[n]) {
-        if (x !== null && isFinite(x)) { xMin = Math.min(xMin, x); xMax = Math.max(xMax, x); }
-      }
-    }
-    DATA.xMin = isFinite(xMin) ? xMin : 0;
-    DATA.xSpan = isFinite(xMax - xMin) ? (xMax - xMin) : 1;
     document.getElementById("gen-time").textContent = DATA.gen_time || "-";
     render(true);
   } else if (window.__LIVE__) {

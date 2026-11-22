@@ -398,6 +398,7 @@ def main() -> None:
             actor_q = float("nan")
             reference_q = float("nan")
             bc_penalty_value = float("nan")
+            actor_loss = None
             if critic_updates % args.critic_per_actor == 0:
                 rollout_mean, _ = sample_training_proposal(
                     actor, batch, 0.0, args.actor_action_limit,
@@ -459,6 +460,7 @@ def main() -> None:
                     "q2_max": float(q2.max().detach()),
                     "td_target": float(td_target.mean().detach()),
                     "critic_loss": float(critic_loss.detach()),
+                    "actor_loss": float(actor_loss.detach()) if actor_loss is not None else None,
                     "actor_q": actor_q if np.isfinite(actor_q) else None,
                     "reference_q": reference_q if np.isfinite(reference_q) else None,
                     "bc": bc_penalty_value if np.isfinite(bc_penalty_value) else None,
