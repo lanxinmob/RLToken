@@ -180,7 +180,7 @@ def parse_log(path: Path):
         return None
     if path.name == "offline_metrics.jsonl":
         labels = {"actor_loss": "Actor loss", "critic_loss": "Twin Critic loss", "bc": "BC MSE"}
-        advantage = "Q(Actor mean) - Q(VLA)"
+        advantage = "Q(Actor mean) - Q(replay reference)"
         series = {name: [] for name in [*labels.values(), advantage]}
         with path.open(encoding="utf-8") as stream:
             for line in stream:

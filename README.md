@@ -90,7 +90,7 @@ Actor 的网络均值为 `VLA参考 + scale * tanh(残差网络输出)`。最后
 `-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`）。
 重训将 checkpoint 和 replay journal 写入新目录。用 `--actor-residual-scale 0` 可训练原全量输出 Actor。
 
-离线日志按 Critic 更新次数记录训练 batch 的指标。用下面的命令生成交互曲线，包括实际 Actor loss、双 Critic 的 TD 均方误差之和、行为克隆 MSE，以及同一 batch 上 Actor 均值动作与 VLA 动作的 Q 值差。
+离线日志按 Critic 更新次数记录训练 batch 的指标。用下面的命令生成交互曲线，包括实际 Actor loss、双 Critic 的 TD 均方误差之和、行为克隆 MSE，以及同一 batch 上 Actor 均值动作与回放参考动作的 Q 值差。残差策略用原始 VLA 动作作参考，缺少原始 VLA 的旧回放使用当时保存的参考动作，其中可能含人工纠正。
 
 ```bash
 RUN=outputs/rlt/YOUR_RETRAIN_RUN
