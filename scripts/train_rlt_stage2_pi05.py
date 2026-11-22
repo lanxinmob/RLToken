@@ -433,6 +433,7 @@ class DeferredBoundarySnapshot:
     grid_phase: float = 0.0
     handoff: tuple[torch.Tensor, torch.Tensor, bool] | None = None
     policy_start: tuple[int, torch.Tensor] | None = None
+    residual_anchor: torch.Tensor | None = None
 
 
 @dataclass
@@ -1032,8 +1033,8 @@ def actor_shadow_metrics(actor, boundary, args, timeline, unnormalize_action, ma
     mean = clamp_actor_action(mean, args.actor_action_limit)
 
     def prepare(actions):
-        commands = timeline.prepare(actions, boundary.preparation, execution_scale=args.actor_execution_scale,
-                                    actor=True)
+        commands = timeline.prepare_policy(actions, boundary.preparation, execution_scale=args.actor_execution_scale,
+                                           reference=boundary.ref_chunk)
         return unnormalize_action(commands)[0].cpu()
 
     candidate = prepare(proposal)
@@ -2506,6 +2507,8 @@ def parse_args():
                         help="Maximum normalized mean correction per dimension for a new Actor (0 = full output)")
     parser.add_argument("--resume_actor_residual_scale", type=float,
                         help="Override a resumed residual Actor's saved scale for rollout and learning")
+    parser.add_argument("--actor_residual_step", type=float,
+                        help="Maximum change in normalized residual per issued command (0 disables)")
     parser.add_argument("--critic_lr", type=float, default=3e-4)
     parser.add_argument("--utd_ratio", type=int, default=5)
     parser.add_argument("--critic_per_actor", type=int, default=2)
@@ -2675,6 +2678,8 @@ def main():
         if args.exec_grid_hz <= 0 or not math.isfinite(args.exec_grid_hz):
             raise ValueError("--exec_grid_hz must be finite and positive.")
     actor_contract_for_scale(args.actor_residual_scale)
+    if args.actor_residual_step is not None and (not math.isfinite(args.actor_residual_step) or args.actor_residual_step < 0):
+        raise ValueError("--actor_residual_step must be finite and non-negative")
     if args.resume_actor_residual_scale is not None:
         if not args.resume_from or not math.isfinite(args.resume_actor_residual_scale) or args.resume_actor_residual_scale <= 0:
             raise ValueError("--resume_actor_residual_scale requires --resume_from and a finite positive scale")
@@ -2779,6 +2784,8 @@ def main():
     if resume_source is not None:
         saved = prepare_resume_checkpoint(resume_source, output_dir, dry_run=True)
         args.actor_residual_scale = checkpoint_actor_scale(saved)
+        if args.actor_residual_step is None:
+            args.actor_residual_step = saved.get("actor_residual_step", 0.0)
         if args.resume_actor_residual_scale is not None:
             if args.actor_residual_scale == 0:
                 raise ValueError("A full-output Actor cannot resume with a residual cap")
@@ -3022,7 +3029,11 @@ def main():
         float(hardware_config["action_hz"]) if hardware_config is not None else args.control_fps,
         args.exec_grid_hz or args.control_fps, args.control_fps,
         args.chunk_smooth_taps, args.start_blend_steps, args.actor_handoff_steps,
+        residual_scale=args.actor_residual_scale, residual_step=args.actor_residual_step or 0.0,
     )
+    if timeline.residual_step:
+        logger.info("Residual command limits: amplitude=%g, change per tick=%g (normalized)",
+                    timeline.residual_scale, timeline.residual_step)
     command_horizon = timeline.steps
     timing_changed = resume_checkpoint is not None and not timeline.compatible_timing(
         resume_checkpoint.get("execution_timing")
@@ -3058,10 +3069,12 @@ def main():
         if action_transform is not None:
             execution_key = "next_execution_state" if next_state else "execution_state"
             return action_transform(action, batch[execution_key], batch["valid_mask"],
+                                    reference=batch["next_ref_chunk"] if next_state else actor_reference(actor, batch),
                                     preparation=batch_preparation(batch, next_state=next_state),
                                     execution_scale=1.0 if reference else args.actor_execution_scale,
                                     actor=not reference)
-        prepared = timeline.prepare(action, batch_preparation(batch, next_state=next_state),
+        prepared = timeline.prepare_policy(action, batch_preparation(batch, next_state=next_state),
+                                    reference=batch["next_ref_chunk"] if next_state else actor_reference(actor, batch),
                                     execution_scale=1.0 if reference else args.actor_execution_scale,
                                     actor=not reference)
         return prepared.masked_fill(~batch["valid_mask"].bool().unsqueeze(-1), 0.0)
@@ -3841,6 +3854,7 @@ def main():
                     aligned_critic_updates=aligned_critic_updates,
                     execution_timing=timeline.profile(),
                     actor_handoff_steps=timeline.actor_handoff_steps,
+                    actor_residual_step=timeline.residual_step,
                     critic_action_steps=command_horizon,
                     runtime_provenance=runtime_provenance,
                     rng_state=capture_rng_state(),
@@ -4088,14 +4102,15 @@ def main():
                             next_action = action_transform(
                                 next_action,
                                 batch["next_execution_state"][bootstrap],
+                                reference=batch["next_ref_chunk"][bootstrap],
                                 preparation=batch_preparation(
                                     {key: value[bootstrap] for key, value in batch.items()}, next_state=True,
                                 ),
                             )
                         else:
-                            next_action = timeline.prepare(next_action, batch_preparation(
+                            next_action = timeline.prepare_policy(next_action, batch_preparation(
                                 {key: value[bootstrap] for key, value in batch.items()}, next_state=True,
-                            ), actor=True)
+                            ), reference=batch["next_ref_chunk"][bootstrap])
                         target_q[bootstrap] = critic_target.q_min(
                             batch["next_z_rl"][bootstrap], critic_proprio(batch, next_state=True)[bootstrap], next_action,
                         )
@@ -4185,8 +4200,9 @@ def main():
                     # gives the paper objective for both VLA and intervention
                     # rows without a second source-dependent BC objective.
                     bc_target = bc_batch["reference_targets"]
-                    prepared_sample = timeline.prepare(
+                    prepared_sample = timeline.prepare_policy(
                         sampled_action, batch_preparation(bc_batch), execution_scale=args.actor_execution_scale,
+                        reference=actor_reference(actor, bc_batch),
                         actor=True,
                     )
                     bc_error = (prepared_sample - bc_target).pow(2).mean(dim=-1)
@@ -4196,8 +4212,9 @@ def main():
                     # Smoothness term is kept in code but disabled by default
                     # for strict paper alignment (delta_weight = 0).
                     ad = rlt_config.action_dim
-                    pred_absolute = unnormalize_action(timeline.prepare(
+                    pred_absolute = unnormalize_action(timeline.prepare_policy(
                         action_mean, batch_preparation(bc_batch), execution_scale=args.actor_execution_scale,
+                        reference=actor_reference(actor, bc_batch),
                         actor=True,
                     )[..., :ad])
                     target_absolute = unnormalize_action(bc_target[..., :ad])
@@ -4612,9 +4629,10 @@ def main():
             stride_mt_error: Exception | None = None
             policy_start: tuple[int, torch.Tensor] | None = None
             policy_handoff = None
+            residual_anchor = None
 
             def begin_policy_segment():
-                nonlocal last_valid_target, policy_handoff, policy_start, next_policy_tick
+                nonlocal last_valid_target, policy_handoff, policy_start, next_policy_tick, residual_anchor
                 if hardware is not None:
                     hardware.set_phase("policy")
                 obs = read_follower_observation("policy entry")
@@ -4626,14 +4644,16 @@ def main():
                 last_valid_target = tensor_to_robot_action(pose, "policy entry")
                 policy_start = (episode_step_counter, normalize_action(pose))
                 policy_handoff = None
+                residual_anchor = None
                 next_policy_tick = None
                 return True
 
-            def plan_metadata(actions, model_start, phase, step_id, start, handoff):
+            def plan_metadata(actions, model_start, phase, step_id, start, handoff, residual_anchor):
                 elapsed = timeline.start_blend_steps if start is None else step_id - start[0]
                 return timeline.metadata(
                     actions[..., :rlt_config.action_dim], model_start, phase=phase, step_id=elapsed,
                     blend_anchor=None if start is None else start[1], handoff=handoff,
+                    residual_anchor=residual_anchor,
                 )
 
             def capture_boundary_snapshot(context: str, step_id: int) -> DeferredBoundarySnapshot | None:
@@ -4646,7 +4666,8 @@ def main():
                     logger.error("Invalid follower observation at %s: %s", context, exc)
                     return None
                 return DeferredBoundarySnapshot(clone_observation(obs), state.detach().clone(), step_id,
-                                                handoff=policy_handoff, policy_start=policy_start)
+                                                handoff=policy_handoff, policy_start=policy_start,
+                                                residual_anchor=residual_anchor)
 
             def await_pi05_plan(step_id: int) -> PrefetchedPi05Plan | None:
                 """Wait without blocking takeover, feedback, preview or hold commands."""
@@ -4699,6 +4720,7 @@ def main():
                 grid_phase: float = 0.0,
                 handoff: tuple[torch.Tensor, torch.Tensor, bool] | None = None,
                 policy_start: tuple[int, torch.Tensor] | None = None,
+                residual_anchor: torch.Tensor | None = None,
             ) -> BoundaryContext:
                 # When raw_actions are cached (stride-2 / HIL snapshot
                 # materialization), skip the action diffusion and only recompute
@@ -4717,7 +4739,8 @@ def main():
                     start_index=raw_action_index,
                     num_steps=rlt_config.n_action_steps_rl,
                 )
-                preparation = plan_metadata(raw_actions, raw_action_index, grid_phase, step_id, policy_start, handoff)
+                preparation = plan_metadata(raw_actions, raw_action_index, grid_phase, step_id, policy_start, handoff,
+                                            residual_anchor)
                 return BoundaryContext(
                     z_rl=z_rl.detach(),
                     proprio=normalize_state(state)[:rlt_config.state_dim].detach(),
@@ -4746,6 +4769,7 @@ def main():
                     grid_phase=snapshot.grid_phase,
                     handoff=snapshot.handoff,
                     policy_start=snapshot.policy_start,
+                    residual_anchor=snapshot.residual_anchor,
                 )
 
             def start_stride_materialization() -> None:
@@ -5101,6 +5125,7 @@ def main():
                             print("[KEY] Actor takeover STOPPED; human HIL active", flush=True)
                         human_active = True
                         policy_handoff = None
+                        residual_anchor = None
                         policy_start = None
                         human_boundary = snapshot
                         teleop.enter_human_mode(args.leader_hil_min_dwell_s)
@@ -5549,7 +5574,7 @@ def main():
                 grid_start = min(grid_start, max(0, full_grid_length - command_horizon))
                 grid_phase = grid_start * timeline.action_hz / timeline.grid_hz - full_plan_start
                 preparation = plan_metadata(full_plan_actions, full_plan_start, grid_phase, episode_step_counter,
-                                            policy_start, policy_handoff)
+                                            policy_start, policy_handoff, residual_anchor)
                 boundary = BoundaryContext(
                     z_rl=z_rl.detach(),
                     proprio=normalize_state(state_tensor)[:rlt_config.state_dim].detach(),
@@ -5610,12 +5635,14 @@ def main():
                 # One preparation path for VLA, Actor, BC and the TD target.
                 # Replace only C model actions; preserve the full VLA plan's
                 # left/right FIR context and its resampling phase.
-                requested_targets = unnormalize_action(timeline.prepare(
+                command_targets = timeline.prepare_policy(
                     requested_actions.detach().cpu(),
                     {key: value.detach().cpu() for key, value in boundary.preparation.items()},
+                    reference=ref_actions.detach().cpu(),
                     execution_scale=args.actor_execution_scale if action_source == "ACTOR" else 1.0,
                     actor=action_source == "ACTOR",
-                ))
+                )
+                requested_targets = unnormalize_action(command_targets)
                 steps_to_execute = command_horizon
                 if action_source == "ACTOR" and args.actor_execution_steps > 0:
                     steps_to_execute = resampled_chunk_length(
@@ -5744,6 +5771,7 @@ def main():
                     if actual_target is None:
                         SHUTDOWN = True
                         break
+                    residual_anchor = command_targets[0, action_offset] - reference_command_rows[action_offset]
                     if action_offset == 0 and shadow_training and window_critical_active and action_source == "VLA":
                         shadow_windows.put(boundary)
                     if visualization is not None:

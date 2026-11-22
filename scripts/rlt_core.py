@@ -50,7 +50,9 @@ def actor_contract_for_scale(scale: float) -> str:
     return "vla_residual_v1" if scale > 0 else "paper_full_output_v1"
 
 
-def checkpoint_actor_scale(checkpoint: dict) -> float:
+def checkpoint_actor_scale(checkpoint: dict, *, raw_command_output: bool = False) -> float:
+    if raw_command_output and checkpoint.get("actor_residual_step", 0):
+        raise ValueError("This Actor requires the Stage 2 command timeline to apply its residual step limit")
     scale = float(checkpoint.get("runtime_provenance", {}).get("actor_residual_scale", 0.0))
     if checkpoint.get("actor_contract") != actor_contract_for_scale(scale):
         raise ValueError(f"Incompatible Actor contract {checkpoint.get('actor_contract')!r} for residual scale {scale}")
@@ -704,6 +706,8 @@ class Transition:
         }
         if "handoff" not in values:
             values = dict(values, handoff=np.zeros((2, dimension)), previous_policy=-1)
+        if "residual_anchor" not in values:
+            values = dict(values, residual_anchor=np.zeros(dimension))
         return {prefix + key: _ensure_array(value, dtype=np.float32) for key, value in values.items()}
 
 

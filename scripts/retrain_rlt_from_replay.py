@@ -82,7 +82,8 @@ def _copy_journal(source: Path, target: Path, limit: int) -> int:
     return limit
 
 
-def _timeline_from_record(record: dict, actor_handoff_steps: int) -> ActionTimeline:
+def _timeline_from_record(record: dict, actor_handoff_steps: int, *, residual_scale=0.0,
+                          residual_step=0.0) -> ActionTimeline:
     timing = np.asarray(record.get("execution_timing"), dtype=np.float32)
     if timing.shape != (7,):
         raise ValueError("Replay rows must contain a seven-value execution_timing signature")
@@ -94,6 +95,7 @@ def _timeline_from_record(record: dict, actor_handoff_steps: int) -> ActionTimel
         smooth_taps=int(timing[5]),
         start_blend_steps=int(timing[6]),
         actor_handoff_steps=int(actor_handoff_steps),
+        residual_scale=residual_scale, residual_step=residual_step,
     )
 
 
@@ -133,6 +135,8 @@ def main() -> None:
     parser.add_argument("--actor-residual-scale", type=float, default=0.05,
                         help="Maximum normalized mean correction per action dimension (0 trains a full-output Actor)")
     parser.add_argument("--actor-action-limit", type=float, default=1.0)
+    parser.add_argument("--actor-residual-step", type=float,
+                        help="Maximum normalized residual change per issued command; defaults to saved setting")
     parser.add_argument("--target-min", type=float, default=0.0,
                         help="Lower TD target bound for terminal 0/1 rewards")
     parser.add_argument("--target-max", type=float, default=1.0,
@@ -189,7 +193,10 @@ def main() -> None:
 
     first_record = _load_first_record(target_journal)
     actor_handoff_steps = int(source_checkpoint.get("actor_handoff_steps", 0))
-    timeline = _timeline_from_record(first_record, actor_handoff_steps)
+    if args.actor_residual_step is None:
+        args.actor_residual_step = source_checkpoint.get("actor_residual_step", 0.0)
+    timeline = _timeline_from_record(first_record, actor_handoff_steps, residual_scale=args.actor_residual_scale,
+                                     residual_step=args.actor_residual_step)
     if int(np.asarray(first_record["action_chunk"]).shape[0]) != timeline.steps:
         raise ValueError(
             "Replay action horizon does not match its execution timing: "
@@ -315,6 +322,7 @@ def main() -> None:
         reference: bool = False,
     ) -> torch.Tensor:
         preparation = _prepare(batch, next_state=next_state)
+        vla = batch["next_ref_chunk"] if next_state else actor_reference(actor, batch)
         if action_transform is not None:
             execution_key = "next_execution_state" if next_state else "execution_state"
             return action_transform(
@@ -322,10 +330,11 @@ def main() -> None:
                 batch[execution_key],
                 batch["valid_mask"],
                 preparation=preparation,
+                reference=vla,
                 execution_scale=1.0,
                 actor=not reference,
             )
-        prepared = timeline.prepare(action, preparation, execution_scale=1.0, actor=not reference)
+        prepared = timeline.prepare_policy(action, preparation, reference=vla, execution_scale=1.0, actor=not reference)
         return prepared.masked_fill(~batch["valid_mask"].bool().unsqueeze(-1), 0.0)
 
     total_updates = args.updates or args.utd_ratio * len(buffer)
@@ -415,9 +424,10 @@ def main() -> None:
                     ).mean()
 
                     bc_target = batch["reference_targets"]
-                    prepared_sample = timeline.prepare(
+                    prepared_sample = timeline.prepare_policy(
                         sampled_action,
                         _prepare(batch),
+                        reference=actor_reference(actor, batch),
                         execution_scale=1.0,
                         actor=True,
                     )
@@ -494,6 +504,7 @@ def main() -> None:
         aligned_critic_updates=critic_updates if action_transform is not None else 0,
         execution_timing=timeline.profile(),
         actor_handoff_steps=actor_handoff_steps,
+        actor_residual_step=timeline.residual_step,
         critic_action_steps=timeline.steps,
         runtime_provenance=runtime_provenance,
         rng_state=capture_rng_state(),

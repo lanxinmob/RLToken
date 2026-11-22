@@ -99,7 +99,7 @@ def build_export_config_kwargs(stage1_ckpt: dict, stage2_ckpt: dict, device: str
         "n_action_steps_rl": chunk_length,
         "action_stride": stride,
         "actor_critic_style": "paper_mlp",
-        "actor_residual_scale": checkpoint_actor_scale(stage2_ckpt),
+        "actor_residual_scale": checkpoint_actor_scale(stage2_ckpt, raw_command_output=True),
         "policy_fixed_std": float(stage2_ckpt.get("policy_fixed_std",
                                                  provenance.get("policy_fixed_std", kwargs.get("policy_fixed_std", 0.05)))),
         # Native LeRobot rollout reads this field to align state and action keys.

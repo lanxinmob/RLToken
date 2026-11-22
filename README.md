@@ -113,6 +113,14 @@ warmup/offline 池均匀采样。online/HIL 池按新旧 transition 的插入年
 要从下个回合开始收紧已有 residual Actor，可在续训命令中追加
 `--resume-actor-residual-scale 0.02`。Actor 和 target Actor 都使用新上限，
 优化器、更新计数和 replay 按原 checkpoint 恢复，新保存的 checkpoint 会记录该上限。
+需要更大的纠偏空间时，可以同时传 `--resume-actor-residual-scale 0.12 --actor-residual-step 0.006`。
+第一项限制每个通道相对 VLA 的总偏移，第二项限制相邻已发送控制步的偏移变化，两者使用归一化动作单位。
+每个短计划取平滑、插值后的平均修正为目标，逐步靠近该目标。跨计划沿用上一条已发送指令的修正；
+关闭 Actor 后逐步回到零，人工接管直接交给操作者，重新进入策略时从零开始。VLA 自身的运动仍受 SDK 执行约束。
+30 Hz 下从零达到 `0.12` 最快需要 20 条指令，约 0.67 秒。旧 replay 未记录上一条修正时，
+训练在对应采样窗口用零作起点。开启此模式的 checkpoint 使用 `./rlt stage2` 的控制时间线执行。
+离线训练参数为 `--actor-residual-scale 0.12 --actor-residual-step 0.006`。
+续训时省略步长参数会沿用 checkpoint；旧 checkpoint 默认步长限制关闭。
 用 `--actor-execute-mean` 可直接评估均值，去除固定标准差的探索采样。下面的起步步数 3 对应已有 beta10 回放。
 
 ```bash

@@ -742,7 +742,7 @@ def load_actor_checkpoint(path: Path) -> dict:
             f"(missing={missing}, actor_contract={checkpoint.get('actor_contract')}, "
             f"rl_chunk_length={checkpoint.get('rl_chunk_length')})."
         )
-    checkpoint_actor_scale(checkpoint)
+    checkpoint_actor_scale(checkpoint, raw_command_output=True)
     return checkpoint
 
 # ─────────────────────────────────────────────────────────────────────────────

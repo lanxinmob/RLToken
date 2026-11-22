@@ -76,6 +76,8 @@ def stage2_retrain(args):
                "--actor-action-limit", str(args.actor_action_limit)]
     if args.init_from_source:
         command.append("--init-from-source")
+    if args.actor_residual_step is not None:
+        command.extend(["--actor-residual-step", str(args.actor_residual_step)])
     if args.gripper_speed is not None:
         command.extend(["--gripper-speed", str(args.gripper_speed)])
     if args.replay_journal is not None:
@@ -159,6 +161,8 @@ def main():
             online.add_argument("--output", type=Path, default=OUTPUT / f"stage2_arx_{datetime.now():%Y%m%d_%H%M%S}")
             online.add_argument("--dry-run", action="store_true")
             online.add_argument("--resume-from", type=Path)
+            online.add_argument("--actor-residual-step", type=float,
+                                help="Maximum normalized residual change per issued command")
             online.add_argument("--resume-actor-residual-scale", type=float,
                                 help="Override the residual cap when continuing a residual Actor")
             online.add_argument("--start-blend-steps", dest="start_blend_steps", type=int,
@@ -222,6 +226,8 @@ def main():
     retrain.add_argument("--actor-residual-scale", type=float, default=0.05,
                          help="Maximum normalized correction to the VLA mean (0 trains a full-output Actor)")
     retrain.add_argument("--actor-action-limit", type=float, default=1.0)
+    retrain.add_argument("--actor-residual-step", type=float,
+                         help="Maximum normalized residual change per issued command")
     args = parser.parse_args()
     if args.command == "check":
         check(args.gpu)

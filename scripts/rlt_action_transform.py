@@ -120,7 +120,7 @@ class ActionTimeline:
     """
 
     def __init__(self, model_steps, action_hz, grid_hz, tick_hz, smooth_taps=0, start_blend_steps=0,
-                 actor_handoff_steps=0):
+                 actor_handoff_steps=0, residual_scale=0.0, residual_step=0.0):
         if not all(np.isfinite(v) and v > 0 for v in (action_hz, grid_hz, tick_hz)):
             raise ValueError("Action, grid and command rates must be finite and positive")
         if grid_hz < action_hz:
@@ -131,6 +131,12 @@ class ActionTimeline:
         self.smooth_taps = int(smooth_taps)
         self.start_blend_steps = int(start_blend_steps)
         self.actor_handoff_steps = int(actor_handoff_steps)
+        self.residual_step = float(residual_step)
+        self.residual_scale = float(residual_scale)
+        if not np.isfinite(self.residual_step) or self.residual_step < 0:
+            raise ValueError("Residual step must be finite and non-negative")
+        if self.residual_step and not (np.isfinite(self.residual_scale) and self.residual_scale > 0):
+            raise ValueError("A residual step limit requires a positive residual Actor scale")
         self.steps = int(np.floor((self.model_steps - 1) * self.grid_hz / self.action_hz + 1e-9)) + 1
         # One additional point is needed to interpolate a fractional final row.
         self.pad = self.smooth_taps // 2 + 1 if self.smooth_taps > 1 else 1
@@ -164,7 +170,8 @@ class ActionTimeline:
         ]).clamp(0, full_actions.shape[1] - 1)
         return full_actions.index_select(1, indices)
 
-    def metadata(self, full_actions, model_start, *, phase=0.0, step_id=0, blend_anchor=None, handoff=None):
+    def metadata(self, full_actions, model_start, *, phase=0.0, step_id=0, blend_anchor=None, handoff=None,
+                 residual_anchor=None):
         import torch
 
         batch, _, dimension = full_actions.shape
@@ -184,6 +191,8 @@ class ActionTimeline:
                          device=full_actions.device),
         ])
         metadata = {
+            "residual_anchor": (torch.zeros(batch, dimension, **options) if residual_anchor is None
+                                else residual_anchor.to(full_actions).reshape(batch, dimension)),
             "context": self.context(full_actions, model_start),
             # A padded full-plan endpoint depends on the Actor only when the
             # replacement includes that endpoint. For a slice starting at 1,
@@ -238,10 +247,32 @@ class ActionTimeline:
         # Keep the gripper unblended, matching Stage 2 vla-only execution.
         result = torch.cat([anchor[..., :-1] + weights * (result[..., :-1] - anchor[..., :-1]),
                             result[..., -1:]], dim=-1)
-        if self.actor_handoff_steps and "handoff" in metadata:
+        # The slew-limited policy uses the independent VLA path as its origin.
+        # Its previous residual already accounts for the outgoing Actor offset.
+        if self.actor_handoff_steps and "handoff" in metadata and not self.residual_step:
             result = blend_policy_handoff(result, metadata["handoff"], metadata["previous_policy"],
                                           actor=actor, steps=self.actor_handoff_steps)
         return result
+
+    def prepare_policy(self, actions, metadata, *, reference=None, execution_scale=1.0, actor=True):
+        """Bound the pre-SDK policy correction relative to the prepared VLA, per command tick."""
+        import torch
+
+        if not self.residual_step:
+            return self.prepare(actions, metadata, execution_scale=execution_scale, actor=actor)
+        baseline = self.prepare(reference if actor else actions, metadata)
+        anchor = metadata["residual_anchor"].to(baseline).unsqueeze(1)
+        if actor:
+            candidate = self.prepare(actions, metadata, execution_scale=execution_scale)
+            # Choose one sustained correction per plan. Alternating residual waypoints
+            # can still produce repeated reversals even when their individual steps are small.
+            goal = (candidate - baseline).clamp(-self.residual_scale, self.residual_scale).mean(dim=1, keepdim=True)
+        else:
+            goal = torch.zeros_like(anchor)
+        ticks = torch.arange(1, baseline.shape[1] + 1, device=baseline.device, dtype=baseline.dtype)
+        budget = (ticks * self.residual_step).view(1, -1, 1)
+        anchor = anchor.clamp(-self.residual_scale, self.residual_scale)
+        return baseline + (anchor + (goal - anchor).clamp(-budget, budget))
 
 
 class AcceptedActionTransform:
@@ -267,14 +298,15 @@ class AcceptedActionTransform:
         self.alpha = float(profile["alpha"])
 
     def __call__(self, requested, execution_state, valid_mask=None, *, preparation=None, execution_scale=None,
-                 actor=True):
+                 actor=True, reference=None):
         import torch
 
         if execution_state.shape != (requested.shape[0], 2, requested.shape[-1]):
             raise ValueError("Execution state must contain previous and filtered physical targets")
         scale = self.execution_scale if execution_scale is None else float(execution_scale)
         if self.timeline is not None:
-            requested = self.timeline.prepare(requested, preparation, execution_scale=scale, actor=actor)
+            requested = self.timeline.prepare_policy(requested, preparation, reference=reference,
+                                                     execution_scale=scale, actor=actor)
         else:
             requested = smooth_actions_torch(requested, self.smooth_taps) * scale
         previous, filtered = execution_state[:, 0], execution_state[:, 1]

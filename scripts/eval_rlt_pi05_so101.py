@@ -495,7 +495,7 @@ def main():
     if not (pi05_path / "config.json").is_file() or not (pi05_path / "model.safetensors").is_file():
         raise FileNotFoundError(f"Incomplete PI0.5 checkpoint: {pi05_path}")
     actor_checkpoint = torch.load(actor_path, map_location=device, weights_only=False)
-    residual_scale = checkpoint_actor_scale(actor_checkpoint)
+    residual_scale = checkpoint_actor_scale(actor_checkpoint, raw_command_output=True)
     if (
         actor_checkpoint.get("schema_version") not in (3, 4)
         or actor_checkpoint.get("rl_chunk_length") != 10
