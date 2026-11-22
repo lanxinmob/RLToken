@@ -5822,7 +5822,7 @@ def main():
                             "action.rlt/accepted_minus_vla": accepted_target - vla_target,
                             "action.rlt/accepted_minus_selected": accepted_target - selected_target,
                             "action.rlt/source": 1 if action_source == "ACTOR" else 0,
-                            "action.rlt/critical": int(window_critical_active),
+                            "action.rlt/critical": int(CRITICAL_PHASE_ACTIVE),
                             "action.rlt/episode": episode,
                             "action.rlt/episode_step": episode_step_counter,
                             "action.rlt/actor_advantage": latest_actor_advantage,
