@@ -23,7 +23,7 @@
     "control_hz": 100,
     "action_hz": 30,
     "joint_speed": 1.0,
-    "gripper_speed": 0.01,
+    "gripper_speed": 0.3,
     "mirror_gain_scale": 0.3,
     "drag_kd_scale": 0.05,
     "drag_gripper_kd": 0.05,

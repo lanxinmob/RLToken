@@ -107,6 +107,10 @@ def main() -> None:
                         help="Existing Stage 2 checkpoint whose replay and runtime contract are reused")
     parser.add_argument("--replay-journal", type=Path, default=None,
                         help="Replay journal override, default is next to --source-checkpoint")
+    parser.add_argument("--init-from-source", action="store_true",
+                        help="Start from the saved Actor, Critic and target weights with fresh optimizers")
+    parser.add_argument("--gripper-speed", type=float,
+                        help="Effective ARX gripper speed after applying the SDK limit, in m/s")
     parser.add_argument("--stage1-checkpoint", type=Path, default=None,
                         help="Stage 1 checkpoint override, default comes from source provenance")
     parser.add_argument("--stats-path", type=Path, default=None,
@@ -161,6 +165,15 @@ def main() -> None:
         raise FileNotFoundError(f"Source checkpoint does not exist: {source_checkpoint_path}")
     source_checkpoint = torch.load(source_checkpoint_path, map_location="cpu", weights_only=False)
     provenance = source_checkpoint.get("runtime_provenance") or {}
+    if args.init_from_source and (provenance.get("actor_residual_scale", 0) > 0) != (args.actor_residual_scale > 0):
+        raise ValueError("Initializing from source requires the same Actor type (residual or full-output)")
+    execution_profile = copy.deepcopy(source_checkpoint.get("execution_transform"))
+    if args.gripper_speed is not None:
+        if not execution_profile or execution_profile.get("contract") != EXECUTION_CONTRACT:
+            raise ValueError("--gripper-speed requires an ARX accepted-target execution profile")
+        if not np.isfinite(args.gripper_speed) or args.gripper_speed <= 0:
+            raise ValueError("--gripper-speed must be finite and positive")
+        execution_profile["max_step"][-1] = args.gripper_speed * execution_profile["step_dt_s"]
 
     source_replay = (args.replay_journal or source_checkpoint_path.parent / "replay_journal.pkl").expanduser().resolve()
     if not source_replay.is_file():
@@ -242,7 +255,6 @@ def main() -> None:
     if action_q01.numel() != action_dim or action_q99.numel() != action_dim:
         raise ValueError("Action normalization statistics do not match replay action dimension")
 
-    execution_profile = source_checkpoint.get("execution_transform")
     action_transform = None
     if execution_profile is not None:
         if execution_profile.get("contract") != EXECUTION_CONTRACT:
@@ -273,6 +285,11 @@ def main() -> None:
         action_steps=timeline.steps,
     ).to(device)
     critic_target = copy.deepcopy(critic).to(device)
+    if args.init_from_source:
+        actor.load_state_dict(source_checkpoint["actor_state_dict"])
+        actor_target.load_state_dict(source_checkpoint["actor_target_state_dict"])
+        critic.load_state_dict(source_checkpoint["critic_state_dict"])
+        critic_target.load_state_dict(source_checkpoint["critic_target_state_dict"])
     for parameter in actor_target.parameters():
         parameter.requires_grad = False
     for parameter in critic_target.parameters():
@@ -450,6 +467,8 @@ def main() -> None:
     shutil.copyfile(source_checkpoint_path.parent / "hardware_info.json", output_dir / "hardware_info.json") \
         if (source_checkpoint_path.parent / "hardware_info.json").is_file() else None
     runtime_provenance = copy.deepcopy(provenance)
+    if args.gripper_speed is not None:
+        runtime_provenance["hardware_config"]["gripper_speed"] = args.gripper_speed
     runtime_provenance.update(actor_residual_scale=args.actor_residual_scale, reference_dropout=args.reference_dropout)
     runtime_provenance.pop("digest", None)
     runtime_provenance["digest"] = canonical_digest(runtime_provenance)

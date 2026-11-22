@@ -87,6 +87,20 @@ Actor 的网络均值为 `VLA参考 + scale * tanh(残差网络输出)`。最后
 `-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`）。
 重训将 checkpoint 和 replay journal 写入新目录。用 `--actor-residual-scale 0` 可训练原全量输出 Actor。
 
+单臂 X5_umi 的默认夹爪速度采用 SDK 原生值 0.30 m/s，30 Hz 下每条夹爪指令最多移动 10 mm。
+从旧 checkpoint 对照试验时，`--gripper-speed` 指定离线训练模拟的有效夹爪速度（m/s），
+省略时沿用采集时的值。历史 replay 中的动作和奖励保留采集时的记录。上机时执行速度取自
+`rlt_stage2.json` 的 `hardware_config.gripper_speed` 并受 SDK 原生值约束。
+
+下面从源 checkpoint 的 Actor、Critic 及各自的 target 权重开始微调，将 residual 上限放宽到 0.10。
+优化器与本次更新计数从零开始，回合编号和 replay 接续源 checkpoint。
+
+```bash
+./rlt stage2-retrain --source-checkpoint outputs/rlt/YOUR_RUN/final_checkpoint.pt \
+  --init-from-source --gripper-speed 0.30 --actor-residual-scale 0.10 \
+  --updates 1200 --output outputs/rlt/stage2_gripper_residual
+```
+
 在线训练的 replay batch 固定由 30% warmup/offline 数据和 70% online/HIL 数据组成。
 warmup/offline 池均匀采样。online/HIL 池按新旧 transition 的插入年龄衰减，并结合每条数据已经被采样的次数做平衡，
 同时保留 20% 的均匀概率下限，旧数据不会被永久饿死。采样计数随 checkpoint 保存并在续训时恢复。

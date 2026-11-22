@@ -73,6 +73,10 @@ def stage2_retrain(args):
                "--policy-fixed-std", str(args.policy_fixed_std),
                "--actor-residual-scale", str(args.actor_residual_scale),
                "--actor-action-limit", str(args.actor_action_limit)]
+    if args.init_from_source:
+        command.append("--init-from-source")
+    if args.gripper_speed is not None:
+        command.extend(["--gripper-speed", str(args.gripper_speed)])
     if args.replay_journal is not None:
         command.extend(["--replay-journal", args.replay_journal.resolve()])
     if args.stage1_checkpoint is not None:
@@ -156,6 +160,10 @@ def main():
                          help="Existing Stage 2 checkpoint; its replay and ARX contract are reused")
     retrain.add_argument("--replay-journal", type=Path,
                          help="Override the replay journal next to the source checkpoint")
+    retrain.add_argument("--init-from-source", action="store_true",
+                         help="Initialize Actor, Critic and target weights from the source; start fresh optimizers")
+    retrain.add_argument("--gripper-speed", type=float,
+                         help="Effective ARX gripper speed in m/s for the offline accepted-target transform")
     retrain.add_argument("--stage1-checkpoint", type=Path,
                          help="Override the Stage 1 checkpoint stored in source provenance")
     retrain.add_argument("--stats-path", type=Path,
