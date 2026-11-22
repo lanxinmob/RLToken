@@ -129,7 +129,7 @@ warmup/offline 池均匀采样。online/HIL 池按新旧 transition 的插入年
   --output outputs/rlt/stage1_new --steps 30000
 ```
 
-运行时 `c` 切换关键阶段，`f` 结束并评价回合，随后用 `y/n/d` 标记成功、失败或丢弃，终端 `q` 正常退出。自动分类器用于触发关键阶段进入，手动关闭后不会在同一回合重新触发。人工接管结束后从新的实测状态重新规划。
+运行时 `c` 切换关键阶段，`f` 结束并评价回合，随后用 `y/n/d` 标记成功、失败或丢弃，终端 `q` 正常退出。启用 `--auto_critical` 后，分类器用 `threshold_on` 自动进入、用 `threshold_off` 自动退出，默认每回合只自动进入一次；手动关闭后不会在同一回合重新触发。人工接管结束后从新的实测状态重新规划。
 
 历史实践使用 50 条示教、28,000 步 VLA 与 30,000 步 Stage 1；在线训练曾发现动作 padding 影响 Q 目标的问题，旧权重不能用于宣称最终策略效果。修正后的在线策略仍需新回合独立评估。
 
@@ -460,7 +460,7 @@ python scripts/train_rlt_stage2_pi05.py --config configs/stage2_pi05.json
 结束本回合，随后在 y/n 提示中判定成败，下一回合随之开始。介入过程会作为修正动作保留，成败在回合
 结束的提示中判定，而不是在交还控制时判定。
 
-若希望关键阶段也自动切换，可以加入
+若希望关键阶段自动进入和退出，可以加入
 `--auto_critical --critical_classifier outputs/critical_classifier_bolt.pt`，此时手动按下的 `c` 键
 仍然优先。
 

@@ -264,8 +264,9 @@ class ConsoleInputManager:
                     self._condition.notify_all()
                 continue
             if value.startswith("c"):
-                # Manual OFF ends the segment even though detector OFF is
-                # ignored in training. Only another c can reopen it.
+                # Manual OFF ends the segment and suppresses automatic re-entry
+                # for the rest of the episode. Automatic OFF is handled by the
+                # classifier at autonomous boundaries.
                 CRITICAL_PHASE_ACTIVE = not CRITICAL_PHASE_ACTIVE
                 CRITICAL_MANUAL_STOPPED = not CRITICAL_PHASE_ACTIVE
                 CRITICAL_MANUAL_OVERRIDE_AT = time.time()
@@ -2394,8 +2395,7 @@ def parse_args():
                         help="Save key frames at critical-phase on/off transitions "
                              "(default: on; use --no-save_critical_frames to disable).")
     parser.add_argument("--auto_critical", action="store_true",
-                        help="Automatically start the critical phase with a trained classifier "
-                             "and keep training active until manual 'c' OFF or episode finish. "
+                        help="Automatically start and stop the critical phase with a trained classifier. "
                              "ARX online training requires manual Actor permission. "
                              "Requires --critical_classifier; 'a' toggles permission and 'c' overrides detection.")
     parser.add_argument("--critical_classifier", type=str, default=None,
@@ -3878,12 +3878,12 @@ def main():
             "keep the leader still to resume policy.\n"
         )
         if args.auto_critical:
-            logger.info("Critical phases are detected automatically; 'c' manually overrides detection for %.1f seconds.",
+            logger.info("Critical phases are detected automatically, including OFF transitions; 'c' manually overrides detection for %.1f seconds.",
                         args.auto_critical_override_cooldown)
         else:
             logger.info("Press 'c' when the critical phase begins; only then is RLT replay recorded.")
         if not args.inference_only:
-            logger.info("Critical training continues until manual 'c' OFF or episode finish ('f'); detector OFF is ignored.")
+            logger.info("Critical training ends on automatic detector OFF or manual 'c' OFF; press 'f' to finish the episode.")
         logger.info("Actor permission: %s; press 'a' to toggle it. Warmup, update-count and critical-phase gates still apply.",
                     "ON" if ACTOR_ENABLED else "OFF")
         logger.info("Press 'g' during episode to skip to next episode.")
@@ -5457,10 +5457,10 @@ def main():
                 if (
                     critical_detector is not None
                     and episode_step_counter >= args.auto_critical_start_delay_steps
-                    # During training the classifier only starts the segment.
-                    # Keep collecting through retries/HIL until the operator
-                    # stops the segment, so a probability dip cannot move the terminal.
-                    and (args.inference_only or not CRITICAL_PHASE_ACTIVE)
+                    # Keep updating while the phase is active so the classifier
+                    # can close the segment automatically when probability falls
+                    # below threshold_off. auto_critical_once only suppresses a
+                    # second automatic ON after that first segment has ended.
                     and not CRITICAL_MANUAL_STOPPED
                     and not (args.auto_critical_once and _auto_fired_once and not CRITICAL_PHASE_ACTIVE)
                     and time.time() - CRITICAL_MANUAL_OVERRIDE_AT >= args.auto_critical_override_cooldown
@@ -5508,8 +5508,8 @@ def main():
                             "[KEY] Critical phase transition saved: ep%d step%d %s (%s)",
                             episode, episode_step_counter, direction, source,
                         )
-                    # Training OFF comes only from manual c; detector OFF can
-                    # still end inference. Both anchor the true segment end.
+                    # Both manual and detector OFF transitions anchor the true
+                    # segment end for terminal replay materialization.
                     if direction == "off" and terminal_snapshot is None:
                         terminal_snapshot = capture_boundary_snapshot(
                             "critical-phase terminal (off)", episode_step_counter,
