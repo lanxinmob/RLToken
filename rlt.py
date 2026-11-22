@@ -159,6 +159,8 @@ def main():
             online.add_argument("--output", type=Path, default=OUTPUT / f"stage2_arx_{datetime.now():%Y%m%d_%H%M%S}")
             online.add_argument("--dry-run", action="store_true")
             online.add_argument("--resume-from", type=Path)
+            online.add_argument("--resume-actor-residual-scale", type=float,
+                                help="Override the residual cap when continuing a residual Actor")
             online.add_argument("--start-blend-steps", dest="start_blend_steps", type=int,
                                 help="Ease from the current pose over N commands at episode start and after HIL")
             online.add_argument("--vla-only", dest="vla_only", action="store_true",

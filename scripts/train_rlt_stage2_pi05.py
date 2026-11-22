@@ -2504,6 +2504,8 @@ def parse_args():
     parser.add_argument("--actor_lr", type=float, default=3e-4)
     parser.add_argument("--actor_residual_scale", type=float, default=0.0,
                         help="Maximum normalized mean correction per dimension for a new Actor (0 = full output)")
+    parser.add_argument("--resume_actor_residual_scale", type=float,
+                        help="Override a resumed residual Actor's saved scale for rollout and learning")
     parser.add_argument("--critic_lr", type=float, default=3e-4)
     parser.add_argument("--utd_ratio", type=int, default=5)
     parser.add_argument("--critic_per_actor", type=int, default=2)
@@ -2673,6 +2675,9 @@ def main():
         if args.exec_grid_hz <= 0 or not math.isfinite(args.exec_grid_hz):
             raise ValueError("--exec_grid_hz must be finite and positive.")
     actor_contract_for_scale(args.actor_residual_scale)
+    if args.resume_actor_residual_scale is not None:
+        if not args.resume_from or not math.isfinite(args.resume_actor_residual_scale) or args.resume_actor_residual_scale <= 0:
+            raise ValueError("--resume_actor_residual_scale requires --resume_from and a finite positive scale")
     if args.actor_action_limit <= 0 or not math.isfinite(args.actor_action_limit):
         raise ValueError("--actor_action_limit must be finite and positive.")
     if args.intervention_reward_bonus != 0:
@@ -2772,14 +2777,19 @@ def main():
     resume_source = Path(args.resume_from).expanduser() if args.resume_from else None
     resume_checkpoint = None
     if resume_source is not None:
-        prepare_resume_checkpoint(resume_source, output_dir, dry_run=True)
+        saved = prepare_resume_checkpoint(resume_source, output_dir, dry_run=True)
+        args.actor_residual_scale = checkpoint_actor_scale(saved)
+        if args.resume_actor_residual_scale is not None:
+            if args.actor_residual_scale == 0:
+                raise ValueError("A full-output Actor cannot resume with a residual cap")
+            args.actor_residual_scale = args.resume_actor_residual_scale
+        del saved
     prepare_output_dir(output_dir, dry_run=args.dry_run)
     if resume_source is not None:
         # inference_only needs no replay journal, so skip the copy (dry_run=True validates only).
         resume_checkpoint = prepare_resume_checkpoint(
             resume_source, output_dir, dry_run=(args.dry_run or args.inference_only),
         )
-        args.actor_residual_scale = checkpoint_actor_scale(resume_checkpoint)
         args.policy_fixed_std = resume_checkpoint.get("policy_fixed_std", args.policy_fixed_std)
 
     # ── Logging split: detailed logs go to <output_dir>/train.log (tail it in a
@@ -3092,6 +3102,8 @@ def main():
         provenance_diff = resume_provenance_diff(
             resume_checkpoint["runtime_provenance"], runtime_provenance
         )
+        if args.resume_actor_residual_scale is not None:
+            provenance_diff = tuple(key for key in provenance_diff if key != "actor_residual_scale")
         if provenance_diff:
             raise ValueError(
                 "Resume checkpoint runtime provenance does not match this Stage 2 invocation: "

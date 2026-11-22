@@ -553,6 +553,8 @@ def run(args):
         command.append("--dry_run")
     if getattr(args, "resume_from", None) is not None:
         command.extend(["--resume_from", str(args.resume_from.resolve())])
+    if getattr(args, "resume_actor_residual_scale", None) is not None:
+        command.extend(["--resume_actor_residual_scale", str(args.resume_actor_residual_scale)])
     if getattr(args, "auto_critical", False):
         command.append("--auto_critical")
     if getattr(args, "async_inference", None) is not None:

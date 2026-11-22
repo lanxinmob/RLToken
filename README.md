@@ -110,6 +110,9 @@ warmup/offline 池均匀采样。online/HIL 池按新旧 transition 的插入年
 默认衰减常数为 2000 条 transition，参数为 `replay_online_decay_steps`。
 
 从训练结果继续在线采集时，Stage 2 从 checkpoint 读取 Actor 类型和残差上限。
+要从下个回合开始收紧已有 residual Actor，可在续训命令中追加
+`--resume-actor-residual-scale 0.02`。Actor 和 target Actor 都使用新上限，
+优化器、更新计数和 replay 按原 checkpoint 恢复，新保存的 checkpoint 会记录该上限。
 用 `--actor-execute-mean` 可直接评估均值，去除固定标准差的探索采样。下面的起步步数 3 对应已有 beta10 回放。
 
 ```bash
