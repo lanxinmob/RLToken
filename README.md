@@ -1,159 +1,46 @@
-> 基于 [Zhengsw03/RL-Token-Pi05-open](https://github.com/Zhengsw03/RL-Token-Pi05-open) 的 SO-101 复现，增加 ARX X5 控制接口、动作转换和人工接管。在线策略更新的独立评估尚未完成。
+## ARX X5 在线训练
 
-## ARX X5 配置与运行
+本项目将 [RL-Token-Pi05-open](https://github.com/Zhengsw03/RL-Token-Pi05-open) 的 Stage 2 接入 ARX X5。SDK 路径填在 `config.json`；模型、相机、CAN 接口和控制参数填在 `rlt_stage2.json`。
 
-π0.5 数据与微调权重由 [pi0.5](https://github.com/lanxinmob/pi0.5) 准备。SDK 环境路径填写在 `config.json`，VLA、编码器、分类器、相机及硬件参数填写在 `rlt_stage2.json`。
+### 算法与控制
+
+- **Actor** 在冻结的 π0.5 参考动作上叠加有界残差。训练损失为 `−min(Q1, Q2) + 10 × BC MSE`。关键阶段记录实际执行的动作，人工接管步用人工指令作为行为克隆目标。
+- **双 Critic** 用控制器接受的动作和有效控制步的折扣回报做 TD 更新。Actor 和 TD 目标使用同一套动作转换。每两次 Critic 更新一次 Actor；在线按 30% warmup、70% online/HIL 采样，离线重训均匀采样。
+- **接管** 由 VLA 开始执行。在线训练就绪后，按 `a` 允许 Actor 在关键阶段接管。自动分类器在概率达到 0.75 时进入、降到 0.45 时退出；`c` 手动切换关键阶段，`h` 切换人工接管。
+- **残差控制** 分别限制相对 VLA 的总偏移和相邻控制步的偏移变化。下方重训示例使用归一化上限 `0.12` 和 `0.006`，跨计划延续上一条修正。
+- **动作输出** 使用异步 RTC 规划，按 30 Hz 发送指令。起步和人工交还时渐入新计划，涉及 Actor 的换块用 5 步三次插值衔接关节轨迹。夹爪独立执行，速度上限为 0.30 m/s。
+
+### 使用示例
+
+安装、检查并开始在线训练。`--display-data` 打开 Rerun。
 
 ```bash
 bash setup_arx.sh
-./rlt check --gpu
 ./rlt stage2-check --auto-critical
-./rlt stage2 --auto-critical --episodes 5
-```
-
-最后一条会连接配置中的执行臂和相机。启动前核对 CAN、标定与工作空间，停止占用同一机械臂的其他控制程序。Stage 2 使用 `.venv`，硬件进程使用配置中指定的 SDK Python。
-
-`rlt_stage2.json` 中的 `actor_handoff_steps` 默认为 5。VLA → Actor、Actor → Actor 和 Actor → VLA
-换块时，六个关节从控制器最后接受的位置出发，用最近两条已接受指令估算起始速度，做三次插值。
-第 5 个控制周期接回新块原定的位置和速度（30 Hz 下约 167 ms），夹爪沿用原定时序。
-设为 0 可关闭换块过渡。
-
-每回合起步或结束人工接管（`h` 或 `s`）时，等待新计划期间的 `HOLD` 保持切回策略时的关节和夹爪位置。
-`start_blend_steps` 控制新计划的起步过渡。ARX 默认 6 条指令，第 1 条关节指令保持该姿态，随后平滑接近计划轨迹，第 6 条接回计划目标。夹爪按新计划的时序执行。
-命令行 `--start-blend-steps N` 可覆盖默认值，0 或 1 关闭起步过渡。
-
-ARX 在线训练每次启动或续训都由 VLA 执行。进入关键阶段后可用 `h` 人工纠正，按 `f` 后用
-`y` 或 `n` 保留回合和反馈。满足 warmup 和回放条件后，Actor 与 Critic 在后台更新。
-执行 VLA 的关键阶段，learner 用同一观测评估 Actor，在本次输出目录写入 `actor_shadow.jsonl`；
-可用 `tail -f "$RUN/actor_shadow.jsonl"` 跟踪，其中 `RUN` 是本次运行的输出目录。
-
-每行对应一个 VLA 窗口。`actor` 按当前执行采样配置生成候选，`mean` 使用 Actor 均值，
-`vla` 是对照。三者的 `peak_step_deg` 和 `over_limit_steps` 覆盖整块六个关节的限速前指令，
-包含从上一条已接受指令到首帧的变化。`peak_actor_vla_deg` 记录同一控制步最大的关节目标偏差；
-夹爪偏差单独以毫米计。观察不同起始姿态与抓取、放置阶段的这些数值后，由操作者按 `a`
-允许 Actor 接管。warmup 结束且达到所需更新次数后，Actor 从下一个符合条件的关键阶段动作块开始执行。
-再按 `a` 可在后续动作块交回 VLA，按 `h` 可随时请求人工接管。影子评估的候选只用于比较，回放记录实机实际执行的数据。
-
-每回合结束、评分前，终端、`train.log` 和 `rl_metrics.log` 会输出一行 `[SHADOW]`。
-对 `mean`、`actor` 和 `vla` 分别取本回合最大的 `peak_step_deg`，并汇总
-`over_limit_steps` 为「超限步数/已评估控制步数」。同一步多个关节超限只计一次。
-参考范围取自本次控制器的关节限速。默认 1 rad/s、30 Hz 时，单关节每步为 0 至约 1.91°，
-超限步数目标为 0。`valid_windows` 显示有效窗口数/提交窗口数。无有效窗口时显示无数据。
-
-要在 Rerun 中查看相机、VLA 目标、Actor 选中目标和 SDK 实际接受的目标，可运行：
-
-```bash
 ./rlt stage2 --auto-critical --episodes 200 --display-data \
-  --display-fps 10 --display-compressed-images
-```
-
-`./rlt stage2` 退出时在终端打印 `[RESUME]`、下次回合编号和一条可直接执行的续训命令。
-命令沿用本次训练参数，下一次运行会创建新的输出目录。正常结束使用最终 checkpoint；
-训练子进程异常退出时，启动器依次检查本次的最终 checkpoint、最近的定期 checkpoint 和启动时的恢复点。
-若已达到总回合目标，打印的命令默认再运行一回合，可调整 `--episodes` 继续到其他总回合数。
-每次启用 `--display-data` 都会在本次输出目录生成 `stage2_visualization.rrd`，即使 Viewer
-启动失败也会保留该文件。训练、推理和评估使用相同的结构化视图，完成后可直接打开：
-
-```bash
-.venv/bin/rerun outputs/rlt/YOUR_RUN/stage2_visualization.rrd
-```
-
-Viewer 中的 `Live camera` 显示腕部相机，`Joint targets (deg)` 同时显示 VLA、Actor
-选中值和 SDK 接受值，`Measured vs accepted (deg)` 显示实际关节状态与发送目标，
-`Joint target error (deg)` 显示 `selected-vla` 和 `accepted-selected`，其余视图显示夹爪、
-控制来源、关键阶段、更新次数、Q 值、Critic loss、Actor loss、TD error、BC loss、Actor advantage 和 shadow 指标。
-ARX 记录将弧度/米转换为度/毫米，SO-101 记录保留度数。相机、目标和指标使用同一条
-`control` 时间线，拖动时间轴即可逐步对齐动作与画面。
-
-推理脚本默认也使用结构化记录，需指定独立输出目录，例如
-`scripts/infer_rlt_stage2_pi05.py --display_data --output_dir outputs/rlt/deploy_run`。
-评估脚本使用 `--display_data --output_dir outputs/rlt/eval_run`。使用 `--display-fps`
-调整刷新率，使用 `--display-compressed-images` 节省带宽。可用
-`../pi05/.tools/bin/uv pip install --python .venv/bin/python 'rerun-sdk>=0.24,<0.34'` 安装 Rerun SDK。
-SDK 安装后还需要同版本的 Rerun Viewer。Linux x86_64 可下载
-`rerun-cli-0.33.1-x86_64-unknown-linux-gnu` 放到 `~/.local/bin/rerun-cli` 并加执行权限，
-或者使用 `cargo binstall --force rerun-cli@0.33.1`。
-
-使用已有 replay 离线训练零初始化的 residual Actor 和新的 Twin Critic：
-
-```bash
-./rlt stage2-retrain \
-  --source-checkpoint outputs/rlt/YOUR_RUN/final_checkpoint.pt \
-  --actor-residual-scale 0.05 \
-  --output outputs/rlt/stage2_retrain_YYYYMMDD_HHMMSS
-```
-
-Actor 的网络均值为 `VLA参考 + scale * tanh(残差网络输出)`。最后一层的权重和偏置从零开始。
-默认 `scale=0.05`，单位是每个动作维度的归一化值。50% reference dropout 只屏蔽残差网络看到的参考，
-加到输出上的 VLA 参考始终保留。新回放分别记录 VLA 输入和人工纠正目标，旧回放沿用当时保存的参考。
-默认每条回放对应 5 次 Critic 更新，每两次 Critic 更新一次 Actor，使用
-`-Q + beta * MSE(actor_action, replay_reference)`（默认 `beta=10`）。
-重训将 checkpoint 和 replay journal 写入新目录。用 `--actor-residual-scale 0` 可训练原全量输出 Actor。
-
-离线日志按 Critic 更新次数记录训练 batch 的指标。用下面的命令生成交互曲线，包括实际 Actor loss、双 Critic 的 TD 均方误差之和、行为克隆 MSE，以及同一 batch 上 Actor 均值动作与回放参考动作的 Q 值差。残差策略用原始 VLA 动作作参考，缺少原始 VLA 的旧回放使用当时保存的参考动作，其中可能含人工纠正。
-
-```bash
-RUN=outputs/rlt/YOUR_RETRAIN_RUN
-.venv/bin/python scripts/plot_rl_metrics.py "$RUN/offline_metrics.jsonl" --out "$RUN/rl_losses_history.html"
-```
-
-冻结权重在 ARX 上评估时，`--episodes` 沿用总回合编号。下面从第 200 回合 checkpoint 开始测 10 回合，沿用采集时的起步过渡和 RTC 参数。自动 critical 开启后，Actor 默认获准在关键阶段执行。每回合按 `f` 结束、用 `y/n` 评分，评估目录的 `training_log.json` 在 `inference_scores` 中单独保存这次的结果。
-
-```bash
-./rlt stage2 --eval-only --auto-critical --actor-execute-mean --episodes 210 \
-  --resume-from "$RUN/final_checkpoint.pt" --start-blend-steps 3 --rtc-max-guidance-weight 8
-```
-
-单臂 X5_umi 的默认夹爪速度采用 SDK 原生值 0.30 m/s，30 Hz 下每条夹爪指令最多移动 10 mm。
-从旧 checkpoint 对照试验时，`--gripper-speed` 指定离线训练模拟的有效夹爪速度（m/s），
-省略时沿用采集时的值。历史 replay 中的动作和奖励保留采集时的记录。上机时执行速度取自
-`rlt_stage2.json` 的 `hardware_config.gripper_speed` 并受 SDK 原生值约束。
-
-下面从源 checkpoint 的 Actor、Critic 及各自的 target 权重开始微调，将 residual 上限放宽到 0.10。
-优化器与本次更新计数从零开始，回合编号和 replay 接续源 checkpoint。
-
-```bash
-./rlt stage2-retrain --source-checkpoint outputs/rlt/YOUR_RUN/final_checkpoint.pt \
-  --init-from-source --gripper-speed 0.30 --actor-residual-scale 0.10 \
-  --updates 1200 --output outputs/rlt/stage2_gripper_residual
-```
-
-在线训练的 replay batch 固定由 30% warmup/offline 数据和 70% online/HIL 数据组成。
-warmup/offline 池均匀采样。online/HIL 池按新旧 transition 的插入年龄衰减，并结合每条数据已经被采样的次数做平衡，
-同时保留 20% 的均匀概率下限，旧数据不会被永久饿死。采样计数随 checkpoint 保存并在续训时恢复。
-默认衰减常数为 2000 条 transition，参数为 `replay_online_decay_steps`。
-
-从训练结果继续在线采集时，Stage 2 从 checkpoint 读取 Actor 类型和残差上限。
-要从下个回合开始收紧已有 residual Actor，可在续训命令中追加
-`--resume-actor-residual-scale 0.02`。Actor 和 target Actor 都使用新上限，
-优化器、更新计数和 replay 按原 checkpoint 恢复，新保存的 checkpoint 会记录该上限。
-需要更大的纠偏空间时，可以同时传 `--resume-actor-residual-scale 0.12 --actor-residual-step 0.006`。
-第一项限制每个通道相对 VLA 的总偏移，第二项限制相邻已发送控制步的偏移变化，两者使用归一化动作单位。
-每个短计划取平滑、插值后的平均修正为目标，逐步靠近该目标。跨计划沿用上一条已发送指令的修正；
-关闭 Actor 后逐步回到零，人工接管直接交给操作者，重新进入策略时从零开始。VLA 自身的运动仍受 SDK 执行约束。
-30 Hz 下从零达到 `0.12` 最快需要 20 条指令，约 0.67 秒。旧 replay 未记录上一条修正时，
-训练在对应采样窗口用零作起点。开启此模式的 checkpoint 使用 `./rlt stage2` 的控制时间线执行。
-离线训练参数为 `--actor-residual-scale 0.12 --actor-residual-step 0.006`。
-续训时省略步长参数会沿用 checkpoint；旧 checkpoint 默认步长限制关闭。
-用 `--actor-execute-mean` 可直接评估均值，去除固定标准差的探索采样。下面的起步步数 3 对应已有 beta10 回放。
-
-```bash
-./rlt stage2 --auto-critical --episodes 200 --actor-execute-mean \
-  --resume-from outputs/rlt/stage2_retrain_YYYYMMDD_HHMMSS/final_checkpoint.pt \
   --start-blend-steps 3 --rtc-max-guidance-weight 8
 ```
 
-更换 VLA 或示教数据后，重新提取特征并训练配套 Stage 1：
+每回合按 `p` 摆位，再按 `p` 开始。按 `f` 结束，用 `y`、`n` 或 `d` 标记成功、失败或丢弃。按 `q` 退出，下次续训使用终端打印的 `[RESUME]` 命令。
+
+用已有回放重新训练 Actor 和 Critic，并生成损失曲线。将 `RUN` 换成采集目录，`MODEL` 指向新的输出目录。
 
 ```bash
-./rlt precompute --output outputs/rlt/embeddings_new
-./rlt stage1 --embeddings outputs/rlt/embeddings_new \
-  --output outputs/rlt/stage1_new --steps 30000
+RUN=outputs/rlt/YOUR_RUN
+MODEL=outputs/rlt/YOUR_RETRAIN_RUN
+./rlt stage2-retrain --source-checkpoint "$RUN/final_checkpoint.pt" \
+  --actor-residual-scale 0.12 --actor-residual-step 0.006 --output "$MODEL"
+.venv/bin/python scripts/plot_rl_metrics.py "$MODEL/offline_metrics.jsonl" --out "$MODEL/rl_losses_history.html"
 ```
 
-运行时 `c` 切换关键阶段，`f` 结束并评价回合，随后用 `y/n/d` 标记成功、失败或丢弃，终端 `q` 正常退出。启用 `--auto_critical` 后，分类器用 `threshold_on` 自动进入、用 `threshold_off` 自动退出，默认每回合只自动进入一次；手动关闭后不会在同一回合重新触发。人工接管结束后从新的实测状态重新规划。
+从第 200 回合的 checkpoint 冻结权重测试 10 回合，执行 Actor 均值动作。`--episodes` 指结束时的总回合编号。
 
-下文保留 SO-101 原项目介绍；其中演示视频与结果对应原项目。
+```bash
+./rlt stage2 --eval-only --auto-critical --actor-execute-mean --episodes 210 \
+  --resume-from "$MODEL/final_checkpoint.pt" --start-blend-steps 3 --rtc-max-guidance-weight 8
+```
+
+下文为 SO-101 原项目文档。
 
 ---
 
