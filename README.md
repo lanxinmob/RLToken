@@ -48,9 +48,24 @@ ARX 在线训练每次启动或续训都由 VLA 执行。进入关键阶段后�
 ```
 
 续训时追加 `--resume-from outputs/rlt/YOUR_RUN/final_checkpoint.pt`。
-动作差值包括 `selected-vla` 和 `accepted-selected`。`observation.rlt/*` 显示 Critic/Actor
-更新次数、Q 值、TD error、BC loss 和 Actor advantage。`rl_metrics.log` 的 `actorAdv` 记录回放上 Actor 均值动作相对 VLA 参考的平均 Q 优势，仅用于监控训练。使用 `--display-fps` 调整刷新率，
-使用 `--display-compressed-images` 节省带宽。可用
+每次启用 `--display-data` 都会在本次输出目录生成 `stage2_visualization.rrd`，即使 Viewer
+启动失败也会保留该文件。训练、推理和评估使用相同的结构化视图，完成后可直接打开：
+
+```bash
+.venv/bin/rerun outputs/rlt/YOUR_RUN/stage2_visualization.rrd
+```
+
+Viewer 中的 `Live camera` 显示腕部相机，`Joint targets (deg)` 同时显示 VLA、Actor
+选中值和 SDK 接受值，`Measured vs accepted (deg)` 显示实际关节状态与发送目标，
+`Joint target error (deg)` 显示 `selected-vla` 和 `accepted-selected`，其余视图显示夹爪、
+控制来源、关键阶段、更新次数、Q 值、TD error、BC loss、Actor advantage 和 shadow 指标。
+ARX 记录将弧度/米转换为度/毫米，SO-101 记录保留度数。相机、目标和指标使用同一条
+`control` 时间线，拖动时间轴即可逐步对齐动作与画面。
+
+推理脚本默认也使用结构化记录，需指定独立输出目录，例如
+`scripts/infer_rlt_stage2_pi05.py --display_data --output_dir outputs/rlt/deploy_run`。
+评估脚本使用 `--display_data --output_dir outputs/rlt/eval_run`。使用 `--display-fps`
+调整刷新率，使用 `--display-compressed-images` 节省带宽。可用
 `../pi05/.tools/bin/uv pip install --python .venv/bin/python 'rerun-sdk>=0.24,<0.34'` 安装 Rerun SDK。
 SDK 安装后还需要同版本的 Rerun Viewer。Linux x86_64 可下载
 `rerun-cli-0.33.1-x86_64-unknown-linux-gnu` 放到 `~/.local/bin/rerun-cli` 并加执行权限，

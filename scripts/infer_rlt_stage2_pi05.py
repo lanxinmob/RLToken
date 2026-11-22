@@ -16,8 +16,8 @@ Key behaviour:
   - Episodes restart at 1; dataset recording uses episode_index from 0.
   - --record_dataset turns rollouts into a standard LeRobotDataset (same format
     as teleoperation data, directly reusable for training).
-  - Rerun visualization follows the same path as lerobot-rollout
-    (log_rerun_data + compress + static).
+  - Rerun visualization publishes named VLA, Actor and SDK-accepted series and
+    saves a stage2_visualization.rrd recording in the deployment output.
   - Camera preflight at startup plus retries for transient observation stalls;
     the leader is not mirrored by default.
 
@@ -1812,26 +1812,32 @@ def main():
     leader_mirror_moving = False  # True while the leader mirror is actively driving the leader
     leader_mirror_heartbeat = 0.0  # last time the mirror thread beat (watchdog)
     visualization = None
-    rerun_shutdown = None
     if args.display_data and not args.dry_run:
         try:
-            from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
-            import rerun as rr  # noqa: F401
-
-            init_rerun(session_name=args.display_session_name)
-            visualization = RerunVisualizationManager(
-                log_rerun_data,
+            visualization = RLTVisualizationManager(
+                output_dir=output_dir,
+                joint_names=(
+                    "shoulder_pan", "shoulder_lift", "elbow_flex",
+                    "wrist_flex", "wrist_roll", "gripper",
+                ),
                 compress_images=args.display_compressed_images,
                 fps=args.display_fps,
+                unit_system="so101",
+                session_name=args.display_session_name,
             )
             visualization.start()
             logger.info(
-                "Rerun visualization enabled (same path as lerobot-rollout): compress=%s, max %.1f FPS",
-                args.display_compressed_images, args.display_fps,
+                "Rerun visualization enabled at up to %.1f FPS. Open the live Viewer or load %s after the run.",
+                args.display_fps, visualization.recording_path,
             )
-            rerun_shutdown = rr.rerun_shutdown
         except Exception as exc:
             logger.warning("Could not start Rerun visualization; continuing without it: %s", exc)
+            if visualization is not None:
+                try:
+                    visualization.stop()
+                except Exception:
+                    logger.debug("Rerun cleanup after startup failure failed", exc_info=True)
+                visualization = None
     try:
         # ── Configure TeleopManager before starting its polling thread ──────
         teleop = TeleopManager(
@@ -2930,6 +2936,18 @@ def main():
                     if actual_target is None:
                         SHUTDOWN = True
                         break
+                    if visualization is not None:
+                        visualization.publish_debug(action={
+                            "action.rlt/vla_target": unnormalize_action(
+                                vla_actions[0, action_offset]
+                            ).detach().cpu(),
+                            "action.rlt/selected_target": target_deg.detach().cpu(),
+                            "action.rlt/accepted_target": actual_target.detach().cpu(),
+                            "action.rlt/source": 1 if action_source == "ACTOR" else 0,
+                            "action.rlt/critical": int(CRITICAL_PHASE_ACTIVE),
+                            "action.rlt/episode": episode,
+                            "action.rlt/episode_step": episode_step_counter,
+                        })
                     # Deployment recording: one frame per execution step, with its own
                     # observation. ``obs`` was read once at the chunk boundary and would
                     # otherwise be written for all steps of the chunk, so the recorded video
@@ -3128,11 +3146,6 @@ def main():
                 visualization.stop()
             except Exception as exc:
                 logger.warning("Rerun visualization cleanup failed: %s", exc)
-        if rerun_shutdown is not None:
-            try:
-                rerun_shutdown()
-            except Exception as exc:
-                logger.warning("Rerun shutdown failed: %s", exc)
         if teleop is not None:
             try:
                 teleop.stop()

@@ -3430,23 +3430,30 @@ def main():
     planner: AsyncPi05Planner | None = None
     planning_log = None
     visualization = None
-    rerun_shutdown = None
     if args.display_data:
         try:
-            from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
-            import rerun as rr
-
-            init_rerun(session_name="rlt_stage2_pi05")
-            visualization = RerunVisualizationManager(
-                log_rerun_data,
+            visualization = RLTVisualizationManager(
+                output_dir=Path(args.output_dir),
+                joint_names=(tuple(hardware.joint_names) if hardware is not None else (
+                    "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper",
+                )),
                 compress_images=args.display_compressed_images,
                 fps=args.display_fps,
+                unit_system="arx" if hardware is not None else "so101",
             )
             visualization.start()
-            rerun_shutdown = rr.rerun_shutdown
-            logger.info("Rerun visualization enabled at up to %.1f FPS.", args.display_fps)
+            logger.info(
+                "Rerun visualization enabled at up to %.1f FPS. Open the live Viewer or load %s after the run.",
+                args.display_fps, visualization.recording_path,
+            )
         except Exception as exc:
             logger.warning("Could not start Rerun visualization; training continues without it: %s", exc)
+            if visualization is not None:
+                try:
+                    visualization.stop()
+                except Exception:
+                    logger.debug("Rerun cleanup after startup failure failed", exc_info=True)
+                visualization = None
     try:
         # ── Configure TeleopManager before starting its polling thread ──────
         teleop = TeleopManager(
@@ -4009,10 +4016,14 @@ def main():
                 stream.write(json.dumps(row, allow_nan=False) + "\n")
             if visualization is not None and "error" not in row:
                 visualization.publish_debug(observation={
+                    "observation.rlt/shadow/mean_peak_step_deg": row["mean"]["peak_step_deg"],
                     "observation.rlt/shadow/actor_peak_step_deg": row["actor"]["peak_step_deg"],
                     "observation.rlt/shadow/vla_peak_step_deg": row["vla"]["peak_step_deg"],
+                    "observation.rlt/shadow/mean_over_limit_steps": row["mean"]["over_limit_steps"],
                     "observation.rlt/shadow/actor_over_limit_steps": row["actor"]["over_limit_steps"],
+                    "observation.rlt/shadow/vla_over_limit_steps": row["vla"]["over_limit_steps"],
                     "observation.rlt/shadow/peak_actor_vla_deg": row["peak_actor_vla_deg"],
+                    "observation.rlt/shadow/peak_actor_vla_gripper_mm": row["peak_actor_vla_gripper_mm"],
                 })
 
         def perform_training_update() -> bool:
@@ -6234,11 +6245,6 @@ def main():
                 visualization.stop()
             except Exception as exc:
                 logger.warning("Rerun visualization cleanup failed: %s", exc)
-        if rerun_shutdown is not None:
-            try:
-                rerun_shutdown()
-            except Exception as exc:
-                logger.warning("Rerun shutdown failed: %s", exc)
         if training_thread is not None:
             training_stop.set()
             try:

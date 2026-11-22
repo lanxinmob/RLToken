@@ -19,6 +19,7 @@ import enum
 import json
 import logging
 import pickle
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -179,7 +180,7 @@ class RerunVisualizationManager:
 
     def _run(self) -> None:
         next_log_time = 0.0
-        while self._running:
+        while True:
             with self._condition:
                 while (
                     self._running
@@ -189,10 +190,16 @@ class RerunVisualizationManager:
                     and self._debug_action is None
                 ):
                     self._condition.wait(timeout=0.1)
-                if not self._running:
+                if (
+                    not self._running
+                    and self._observation is None
+                    and self._action is None
+                    and self._debug_observation is None
+                    and self._debug_action is None
+                ):
                     return
                 wait_s = next_log_time - time.monotonic()
-                if wait_s > 0:
+                if self._running and wait_s > 0:
                     self._condition.wait(timeout=wait_s)
                     continue
                 # Action receipts and their diagnostic comparison arrive from
@@ -221,6 +228,371 @@ class RerunVisualizationManager:
             self._condition.notify_all()
         if self._thread:
             self._thread.join(timeout=0.5)
+
+
+class RLTVisualizationManager(RerunVisualizationManager):
+    """Stage-2 Rerun view with physical units, named series and an .rrd recording.
+
+    The generic LeRobot logger is useful for arbitrary observation dictionaries,
+    but it flattens the control contract into unnamed scalar arrays. Stage 2
+    needs the VLA, Actor, SDK-accepted and measured signals aligned on one
+    control timeline, so this manager publishes those entities explicitly.
+    """
+
+    _TARGET_COLORS = [(66, 133, 244, 255), (245, 124, 0, 255), (52, 168, 83, 255)]
+    _ERROR_COLORS = [(156, 39, 176, 255), (229, 57, 53, 255)]
+
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        joint_names: tuple[str, ...] | list[str],
+        compress_images: bool,
+        fps: float,
+        unit_system: str = "arx",
+        session_name: str | None = None,
+        spawn_viewer: bool = True,
+    ) -> None:
+        self.output_dir = Path(output_dir)
+        self.joint_names = tuple(str(name) for name in joint_names)
+        if unit_system not in {"arx", "so101"}:
+            raise ValueError(f"Unsupported Rerun unit system: {unit_system!r}")
+        self.unit_system = unit_system
+        self.session_name = session_name
+        self._spawn_viewer = bool(spawn_viewer)
+        self._rr = None
+        self._sequence = 0
+        self._last_accepted: np.ndarray | None = None
+        self._recording_path = self.output_dir / "stage2_visualization.rrd"
+        super().__init__(self._log_sample, compress_images=compress_images, fps=fps)
+
+    @property
+    def recording_path(self) -> Path:
+        return self._recording_path
+
+    def start(self) -> None:
+        import rerun as rr
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        app_id = (self.session_name or f"rlt_stage2_pi05_{self.output_dir.name}").replace("-", "_")
+        rr.init(app_id, spawn=False)
+        rr.save(self._recording_path)
+        self._rr = rr
+        self._send_blueprint()
+
+        viewer_path = shutil.which("rerun") or shutil.which("rerun-cli")
+        if self._spawn_viewer and viewer_path:
+            try:
+                rr.spawn(
+                    executable_path=viewer_path,
+                    hide_welcome_screen=True,
+                    memory_limit="20%",
+                    server_memory_limit="2GiB",
+                )
+                logger.info("Rerun Viewer connected using %s", viewer_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Rerun Viewer could not be started (%s). The recording will still be written to %s.",
+                    exc, self._recording_path,
+                )
+        elif self._spawn_viewer:
+            logger.warning(
+                "No rerun viewer executable was found. The recording will be written to %s.",
+                self._recording_path,
+            )
+        super().start()
+        logger.info("Rerun recording: %s", self._recording_path)
+
+    def stop(self) -> None:
+        super().stop()
+        if self._rr is not None:
+            try:
+                self._rr.rerun_shutdown()
+            finally:
+                self._rr = None
+
+    def _path(self, group: str, joint: str, signal: str) -> str:
+        return f"robot/{group}/{joint}/{signal}"
+
+    def _send_blueprint(self) -> None:
+        import rerun.blueprint as rrb
+
+        arm = self.joint_names[:-1] if len(self.joint_names) > 1 else self.joint_names
+        target_paths = [self._path("joints", name, "target") for name in arm]
+        actual_paths = [self._path("joints", name, "actual") for name in arm]
+        accepted_paths = [self._path("joints", name, "accepted") for name in arm]
+        error_paths = [self._path("joints", name, "error") for name in arm]
+        gripper_target = [self._path("gripper", "gripper", "target")]
+        gripper_actual = [self._path("gripper", "gripper", "actual")]
+        gripper_accepted = [self._path("gripper", "gripper", "accepted")]
+        gripper_error = [self._path("gripper", "gripper", "error")]
+        summary = [
+            "robot/summary/source",
+            "robot/summary/critical",
+            "robot/summary/episode",
+            "robot/summary/episode_step",
+            "robot/summary/max_step_deg",
+            "robot/summary/max_selected_vla_deg",
+            "robot/summary/max_accepted_selected_deg",
+        ]
+        training = [
+            "training/updates/total",
+            "training/updates/critic",
+            "training/updates/actor",
+            "training/updates/aligned_critic",
+            "training/q1_mean",
+            "training/q2_mean",
+            "training/td_error",
+            "training/actor_q",
+            "training/reference_q",
+            "training/actor_advantage",
+            "training/bc_loss",
+            "training/shadow/mean_peak_step_deg",
+            "training/shadow/actor_peak_step_deg",
+            "training/shadow/vla_peak_step_deg",
+            "training/shadow/mean_over_limit_steps",
+            "training/shadow/actor_over_limit_steps",
+            "training/shadow/vla_over_limit_steps",
+            "training/shadow/peak_actor_vla_deg",
+            "training/shadow/peak_actor_vla_gripper_mm",
+        ]
+        views = [
+            rrb.Spatial2DView(origin="camera/wrist", name="Live camera"),
+            rrb.TimeSeriesView(name="Joint targets (deg)", contents=target_paths),
+            rrb.TimeSeriesView(name="Measured vs accepted (deg)", contents=actual_paths + accepted_paths),
+            rrb.TimeSeriesView(name="Joint target error (deg)", contents=error_paths),
+            rrb.TimeSeriesView(
+                name=f"Gripper ({'mm' if self.unit_system == 'arx' else 'deg'})",
+                contents=gripper_target + gripper_actual + gripper_accepted + gripper_error,
+            ),
+            rrb.TimeSeriesView(name="Robot state", contents=summary),
+            rrb.TimeSeriesView(name="Training and shadow metrics", contents=training),
+            rrb.TextLogView(name="Control events", contents=["status/events"]),
+        ]
+        self._rr.send_blueprint(rrb.Blueprint(rrb.Grid(*views, grid_columns=2)))
+
+        for name in arm:
+            self._rr.log(
+                self._path("joints", name, "target"),
+                self._rr.SeriesLines(names=["VLA", "selected", "SDK accepted"], colors=self._TARGET_COLORS),
+                static=True,
+            )
+            self._rr.log(
+                self._path("joints", name, "error"),
+                self._rr.SeriesLines(names=["selected - VLA", "accepted - selected"], colors=self._ERROR_COLORS),
+                static=True,
+            )
+            self._rr.log(
+                self._path("joints", name, "accepted"),
+                self._rr.SeriesLines(names=["SDK accepted"], colors=[self._TARGET_COLORS[2]]),
+                static=True,
+            )
+        self._rr.log(
+            self._path("gripper", "gripper", "target"),
+            self._rr.SeriesLines(names=["VLA", "selected", "SDK accepted"], colors=self._TARGET_COLORS),
+            static=True,
+        )
+        self._rr.log(
+            self._path("gripper", "gripper", "error"),
+            self._rr.SeriesLines(names=["selected - VLA", "accepted - selected"], colors=self._ERROR_COLORS),
+            static=True,
+        )
+        self._rr.log(
+            self._path("gripper", "gripper", "accepted"),
+            self._rr.SeriesLines(names=["SDK accepted"], colors=[self._TARGET_COLORS[2]]),
+            static=True,
+        )
+
+    @staticmethod
+    def _array(value) -> np.ndarray | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        try:
+            result = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        return result if np.isfinite(result).all() else None
+
+    @staticmethod
+    def _image_array(value) -> np.ndarray | None:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        try:
+            result = np.asarray(value)
+        except (TypeError, ValueError):
+            return None
+        if result.ndim not in (2, 3):
+            return None
+        if np.issubdtype(result.dtype, np.floating) and not np.isfinite(result).all():
+            return None
+        return result
+
+    def _find_array(self, values: dict, key: str) -> np.ndarray | None:
+        for candidate in (key, f"action.{key}", f"observation.{key}"):
+            if candidate in values:
+                return self._array(values[candidate])
+        return None
+
+    def _joint_values(self, observation: dict) -> np.ndarray | None:
+        values = []
+        for name in self.joint_names:
+            value = None
+            for key in (f"{name}.pos", name):
+                if key in observation:
+                    value = self._array(observation[key])
+                    break
+            if value is None or value.size != 1:
+                return None
+            values.append(float(value.reshape(-1)[0]))
+        return np.asarray(values, dtype=np.float64)
+
+    def _camera(self, observation: dict) -> np.ndarray | None:
+        preferred = ("cam_wrist", "observation.images.cam_wrist", "wrist")
+        for key in preferred:
+            if key in observation:
+                value = self._image_array(observation[key])
+                if value is not None:
+                    return value
+        for key, value in observation.items():
+            if str(key).endswith(".pos") or str(key).startswith("_"):
+                continue
+            array = self._image_array(value)
+            if array is not None and min(array.shape[-2:]) > 16:
+                return array
+        return None
+
+    def _physical(self, values: np.ndarray) -> np.ndarray:
+        result = values.astype(np.float64, copy=True)
+        if result.size and self.unit_system == "arx":
+            result[:-1] = np.rad2deg(result[:-1])
+            result[-1] *= 1000.0
+        return result
+
+    def _log_scalar(self, path: str, value: float) -> None:
+        if np.isfinite(value):
+            self._rr.log(path, self._rr.Scalars(float(value)))
+
+    def _log_vector_series(self, path: str, values: np.ndarray, names: list[str]) -> None:
+        if values.size == len(names) and np.isfinite(values).all():
+            self._rr.log(path, self._rr.Scalars(values.astype(np.float64)))
+
+    def _log_sample(self, observation: dict | None, action: dict | None, compress_images: bool = False) -> None:
+        if self._rr is None:
+            return
+        self._rr.set_time("control", sequence=self._sequence)
+        self._sequence += 1
+
+        if observation:
+            camera = self._camera(observation)
+            if camera is not None:
+                if camera.ndim == 3 and camera.shape[0] in (1, 3, 4) and camera.shape[-1] not in (1, 3, 4):
+                    camera = np.transpose(camera, (1, 2, 0))
+                if camera.ndim == 2:
+                    camera = np.repeat(camera[..., None], 3, axis=-1)
+                if camera.dtype != np.uint8:
+                    camera = np.clip(camera, 0, 255).astype(np.uint8)
+                entity = self._rr.Image(camera)
+                if compress_images:
+                    entity = entity.compress()
+                self._rr.log("camera/wrist", entity)
+
+            measured = self._joint_values(observation)
+            if measured is not None:
+                measured_physical = self._physical(measured)
+                for index, name in enumerate(self.joint_names[:-1]):
+                    self._log_scalar(self._path("joints", name, "actual"), measured_physical[index])
+                if self.joint_names:
+                    self._log_scalar(self._path("gripper", "gripper", "actual"), measured_physical[-1])
+
+        if not action:
+            return
+        vla = self._find_array(action, "rlt/vla_target")
+        selected = self._find_array(action, "rlt/selected_target")
+        accepted = self._find_array(action, "rlt/accepted_target")
+        if accepted is None:
+            accepted = self._joint_values(action)
+        if vla is not None and vla.size == len(self.joint_names):
+            vla = vla.reshape(-1)
+        if selected is not None and selected.size == len(self.joint_names):
+            selected = selected.reshape(-1)
+        if accepted is not None and accepted.size == len(self.joint_names):
+            accepted = accepted.reshape(-1)
+        if vla is not None and selected is not None and accepted is not None:
+            vla_physical = self._physical(vla)
+            selected_physical = self._physical(selected)
+            accepted_physical = self._physical(accepted)
+            for index, name in enumerate(self.joint_names[:-1]):
+                self._log_vector_series(
+                    self._path("joints", name, "target"),
+                    np.asarray([vla_physical[index], selected_physical[index], accepted_physical[index]]),
+                    ["VLA", "selected", "SDK accepted"],
+                )
+                self._log_vector_series(
+                    self._path("joints", name, "error"),
+                    np.asarray([
+                        selected_physical[index] - vla_physical[index],
+                        accepted_physical[index] - selected_physical[index],
+                    ]),
+                    ["selected - VLA", "accepted - selected"],
+                )
+                self._log_scalar(self._path("joints", name, "accepted"), accepted_physical[index])
+            self._log_vector_series(
+                self._path("gripper", "gripper", "target"),
+                np.asarray([vla_physical[-1], selected_physical[-1], accepted_physical[-1]]),
+                ["VLA", "selected", "SDK accepted"],
+            )
+            self._log_vector_series(
+                self._path("gripper", "gripper", "error"),
+                np.asarray([
+                    selected_physical[-1] - vla_physical[-1],
+                    accepted_physical[-1] - selected_physical[-1],
+                ]),
+                ["selected - VLA", "accepted - selected"],
+            )
+            self._log_scalar(self._path("gripper", "gripper", "accepted"), accepted_physical[-1])
+            if self._last_accepted is not None:
+                step = np.abs(accepted_physical[:-1] - self._last_accepted[:-1])
+                self._log_scalar("robot/summary/max_step_deg", float(step.max()))
+            self._last_accepted = accepted_physical
+            self._log_scalar("robot/summary/max_selected_vla_deg", float(np.abs(selected_physical[:-1] - vla_physical[:-1]).max()))
+            self._log_scalar("robot/summary/max_accepted_selected_deg", float(np.abs(accepted_physical[:-1] - selected_physical[:-1]).max()))
+
+        source = self._find_array(action, "rlt/source")
+        critical = self._find_array(action, "rlt/critical")
+        episode = self._find_array(action, "rlt/episode")
+        episode_step = self._find_array(action, "rlt/episode_step")
+        for path, value in (
+            ("robot/summary/source", source),
+            ("robot/summary/critical", critical),
+            ("robot/summary/episode", episode),
+            ("robot/summary/episode_step", episode_step),
+        ):
+            if value is not None and value.size == 1:
+                self._log_scalar(path, float(value.reshape(-1)[0]))
+        actor_advantage = self._find_array(action, "rlt/actor_advantage")
+        if actor_advantage is not None and actor_advantage.size == 1:
+            self._log_scalar("training/actor_advantage", float(actor_advantage.reshape(-1)[0]))
+
+        source_value = int(source.reshape(-1)[0]) if source is not None and source.size == 1 else 0
+        source_name = "Actor" if source_value == 1 else "VLA"
+        critical_value = int(critical.reshape(-1)[0]) if critical is not None and critical.size == 1 else 0
+        step_value = int(episode_step.reshape(-1)[0]) if episode_step is not None and episode_step.size == 1 else -1
+        self._rr.log(
+            "status/events",
+            self._rr.TextLog(f"source={source_name} critical={critical_value} control_step={step_value}"),
+        )
+
+        if observation:
+            for key, value in observation.items():
+                if not str(key).startswith("observation.rlt/"):
+                    continue
+                array = self._array(value)
+                if array is None or array.size != 1:
+                    continue
+                metric = str(key).removeprefix("observation.rlt/").replace("/", "_")
+                self._log_scalar(f"training/{metric}", float(array.reshape(-1)[0]))
 
 
 class TransitionSource(enum.IntEnum):
@@ -611,6 +983,7 @@ __all__ = [
     "action_order_indices",
     "reorder_action_tensor",
     "RerunVisualizationManager",
+    "RLTVisualizationManager",
     "TransitionSource",
     "collection_phase_to_id",
     "_ensure_array",

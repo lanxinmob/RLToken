@@ -429,6 +429,8 @@ def parse_args():
     parser.add_argument("--display_data", action="store_true")
     parser.add_argument("--display_compressed_images", action="store_true")
     parser.add_argument("--display_fps", type=float, default=10.0)
+    parser.add_argument("--output_dir", type=str, default="outputs/rlt/eval_rlt_pi05",
+                        help="Directory for the evaluation logs and stage2_visualization.rrd")
     parser.add_argument("--score_episodes", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     config_probe = argparse.ArgumentParser(add_help=False)
@@ -569,10 +571,18 @@ def main():
     visualization = None
     try:
         if args.display_data:
-            from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
-            init_rerun(session_name="eval_rlt_pi05")
-            visualization = RerunVisualizationManager(log_rerun_data, args.display_compressed_images, args.display_fps)
+            visualization = RLTVisualizationManager(
+                output_dir=Path(args.output_dir).expanduser(),
+                joint_names=tuple(SO101_JOINT_NAMES),
+                compress_images=args.display_compressed_images,
+                fps=args.display_fps,
+                unit_system="so101",
+            )
             visualization.start()
+            logger.info(
+                "Rerun visualization enabled at up to %.1f FPS. Open the live Viewer or load %s after the run.",
+                args.display_fps, visualization.recording_path,
+            )
         follower.connect()
         # Keep the policy/robot order in one shared source of truth.  LeRobot's
         # feature dictionaries may expose the same names in another order.
@@ -638,10 +648,11 @@ def main():
                 )
                 z_rl = encoder(prefix_out.float(), mask=prefix_mask)
             return raw_actions_full, z_rl
-        def send(action_tensor: torch.Tensor) -> None:
+        def send(action_tensor: torch.Tensor) -> dict:
             target = {f"{name}.pos": float(action_tensor[i]) for i, name in enumerate(joint_names)}
             actual = follower.send_action(target)
             if visualization: visualization.publish_action(actual)
+            return actual
         successes = []
         execution_steps = (
             rlt_config.n_action_steps_rl
@@ -709,8 +720,23 @@ def main():
                 # The postprocessor takes the raw action tensor directly and returns
                 # the unnormalized action chunk.
                 final_actions = postprocessor(actor_actions)
-                for action in final_actions[0, :execution_steps]:
-                    send(action.detach().cpu())
+                vla_actions_physical = postprocessor(raw_ref)
+                for action_offset, action in enumerate(final_actions[0, :execution_steps]):
+                    actual = send(action.detach().cpu())
+                    if visualization:
+                        accepted = torch.tensor(
+                            [actual[f"{name}.pos"] for name in joint_names],
+                            dtype=torch.float32,
+                        )
+                        visualization.publish_debug(action={
+                            "action.rlt/vla_target": vla_actions_physical[0, action_offset].detach().cpu(),
+                            "action.rlt/selected_target": final_actions[0, action_offset].detach().cpu(),
+                            "action.rlt/accepted_target": accepted,
+                            "action.rlt/source": 1,
+                            "action.rlt/critical": 0,
+                            "action.rlt/episode": episode,
+                            "action.rlt/episode_step": action_offset,
+                        })
                     time.sleep(1 / args.control_fps)
                 # Receding-horizon actor execution (partial windows) forces a
                 # fresh plan on the next iteration by clearing the cache, so the
