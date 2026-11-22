@@ -47,7 +47,10 @@ ARX 在线训练每次启动或续训都由 VLA 执行。进入关键阶段后�
   --display-fps 10 --display-compressed-images
 ```
 
-续训时追加 `--resume-from outputs/rlt/YOUR_RUN/final_checkpoint.pt`。
+`./rlt stage2` 退出时在终端打印 `[RESUME]`、下次回合编号和一条可直接执行的续训命令。
+命令沿用本次训练参数，下一次运行会创建新的输出目录。正常结束使用最终 checkpoint；
+训练子进程异常退出时，启动器依次检查本次的最终 checkpoint、最近的定期 checkpoint 和启动时的恢复点。
+若已达到总回合目标，打印的命令默认再运行一回合，可调整 `--episodes` 继续到其他总回合数。
 每次启用 `--display-data` 都会在本次输出目录生成 `stage2_visualization.rrd`，即使 Viewer
 启动失败也会保留该文件。训练、推理和评估使用相同的结构化视图，完成后可直接打开：
 

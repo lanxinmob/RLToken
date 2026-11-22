@@ -6,6 +6,7 @@ import importlib.metadata
 import json
 import math
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -84,6 +85,44 @@ def stage2_retrain(args):
     if args.stats_path is not None:
         command.extend(["--stats-path", args.stats_path.resolve()])
     run(command)
+
+
+def print_stage2_resume(args, options):
+    from scripts.train_rlt_stage2_pi05 import prepare_resume_checkpoint
+
+    output = Path(args.output).resolve()
+    periodic = []
+    for path in output.glob("checkpoint_ep*.pt"):
+        number = path.stem.removeprefix("checkpoint_ep")
+        if number.isdigit():
+            periodic.append((int(number), path))
+    candidates = [output / "final_checkpoint.pt"]
+    candidates.extend(path for _, path in sorted(periodic, reverse=True))
+    if args.resume_from:
+        candidates.append(args.resume_from.resolve())
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            saved = prepare_resume_checkpoint(path, output / "_preflight", dry_run=True)
+            episode = int(saved["episode"])
+        except Exception as exc:
+            print(f"[RESUME] 跳过 {path}: {exc}", file=sys.stderr)
+            continue
+        # Retain the CLI's original flags and values, including aliases and shell-sensitive paths.
+        replaced = argparse.ArgumentParser(add_help=False)
+        replaced.add_argument("--episodes", "--output", "--resume-from")
+        _, flags = replaced.parse_known_args(options)
+        display_path = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+        target = max(args.episodes, episode + 1)
+        command = ["./rlt", "stage2", *flags, "--episodes", str(target), "--resume-from", str(display_path)]
+        print(f"\n[RESUME] 从第 {episode + 1} 回合续训（总回合目标 {target}）", flush=True)
+        if (path.parent / "replay_journal.pkl").stat().st_size > saved["replay_journal_bytes"]:
+            print("[RESUME] 日志里还有此 checkpoint 之后的回放，此命令只恢复到上面标出的回合边界。")
+        print(shlex.join(command), flush=True)
+        return
+    print("[RESUME] 本次没有可恢复的 checkpoint。", flush=True)
 
 
 def main():
@@ -205,7 +244,14 @@ def main():
         else:
             if args.episodes < 1:
                 parser.error("episodes must be positive")
-            stage2_run(args)
+            try:
+                stage2_run(args)
+            except subprocess.CalledProcessError as exc:
+                print(f"Stage 2 exited with status {exc.returncode}", file=sys.stderr)
+                raise SystemExit(exc.returncode if exc.returncode >= 0 else 128 - exc.returncode)
+            finally:
+                if not args.dry_run and not args.vla_only:
+                    print_stage2_resume(args, sys.argv[2:])
 
 
 if __name__ == "__main__":
