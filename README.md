@@ -1,48 +1,118 @@
-## ARX X5 在线训练
+# RLToken · ARX X5
 
-本项目将 [RL-Token-Pi05-open](https://github.com/Zhengsw03/RL-Token-Pi05-open) 的 Stage 2 接入 ARX X5。SDK 路径填在 `config.json`；模型、相机、CAN 接口和控制参数填在 `rlt_stage2.json`。
+在 ARX X5 机械臂上做 [RL Token](https://pi.website/research/rlt) 真机在线强化学习：冻结的 π0.5 给出参考动作，Actor 只在关键阶段叠加一层有界的残差修正，Critic 在后台异步更新。
 
-### 算法与控制
+本仓库基于 [RL-Token-Pi05](https://github.com/Zhengsw03/RL-Token-Pi05-open)（SO-101 版）改造，新增的是 Stage 2 在 ARX X5 上的接入。数据采集、π0.5 微调、RL Token 和关键阶段分类器的训练与上游相同，见文末[附：SO-101 上游文档](#附so-101-上游文档)。
 
-- **Actor** 在冻结的 π0.5 参考动作上叠加有界残差。训练损失为 `−min(Q1, Q2) + 10 × BC MSE`。关键阶段记录实际执行的动作，人工接管步用人工指令作为行为克隆目标。
-- **双 Critic** 用控制器接受的动作和有效控制步的折扣回报做 TD 更新。Actor 和 TD 目标使用同一套动作转换。每两次 Critic 更新一次 Actor；在线按 30% warmup、70% online/HIL 采样，离线重训均匀采样。
-- **接管** 由 VLA 开始执行。在线训练就绪后，按 `a` 允许 Actor 在关键阶段接管。自动分类器在概率达到 0.75 时进入、降到 0.45 时退出；`c` 手动切换关键阶段，`h` 切换人工接管。
-- **残差控制** 分别限制相对 VLA 的总偏移和相邻控制步的偏移变化。下方重训示例使用归一化上限 `0.12` 和 `0.006`，跨计划延续上一条修正。
-- **动作输出** 使用异步 RTC 规划，按 30 Hz 发送指令。起步和人工交还时渐入新计划，涉及 Actor 的换块用 5 步三次插值衔接关节轨迹。夹爪独立执行，速度上限为 0.30 m/s。
+## 快速开始
 
-### 使用示例
-
-安装、检查并开始在线训练。`--display-data` 打开 Rerun。
+### 1. 安装与配置
 
 ```bash
 bash setup_arx.sh
+```
+
+- `config.json`：ARX SDK 路径（可从 `config.example.json` 复制）
+- `rlt_stage2.json`：模型路径、相机、CAN 接口、控制参数
+
+### 2. 自检
+
+```bash
 ./rlt stage2-check --auto-critical
+```
+
+### 3. 在线训练
+
+```bash
 ./rlt stage2 --auto-critical --episodes 200 --display-data \
   --start-blend-steps 3 --rtc-max-guidance-weight 8
 ```
 
-每回合按 `p` 摆位，再按 `p` 开始。按 `f` 结束，用 `y`、`n` 或 `d` 标记成功、失败或丢弃。按 `q` 退出，下次续训使用终端打印的 `[RESUME]` 命令。
+- `--display-data` 会打开 Rerun 可视化。
+- 中途按 `q` 退出后，用终端打印的 `[RESUME]` 命令续训。
 
-用已有回放重新训练 Actor 和 Critic，并生成损失曲线。将 `RUN` 换成采集目录，`MODEL` 指向新的输出目录。
+### 4. 离线重训（可选）
+
+用已采集的回放重新训练 Actor 和 Critic，并绘制损失曲线，可更换[残差限幅](#残差限幅)参数。`RUN` 为在线训练输出目录，`MODEL` 为新的输出目录。
 
 ```bash
 RUN=outputs/rlt/YOUR_RUN
 MODEL=outputs/rlt/YOUR_RETRAIN_RUN
 ./rlt stage2-retrain --source-checkpoint "$RUN/final_checkpoint.pt" \
   --actor-residual-scale 0.12 --actor-residual-step 0.006 --output "$MODEL"
-.venv/bin/python scripts/plot_rl_metrics.py "$MODEL/offline_metrics.jsonl" --out "$MODEL/rl_losses_history.html"
+.venv/bin/python scripts/plot_rl_metrics.py "$MODEL/offline_metrics.jsonl" \
+  --out "$MODEL/rl_losses_history.html"
 ```
 
-从第 200 回合的 checkpoint 冻结权重测试 10 回合，执行 Actor 均值动作。`--episodes` 指结束时的总回合编号。
+### 5. 评估
+
+冻结权重，从第 200 回合的 checkpoint 再跑 10 回合，Actor 执行均值动作。
 
 ```bash
 ./rlt stage2 --eval-only --auto-critical --actor-execute-mean --episodes 210 \
   --resume-from "$MODEL/final_checkpoint.pt" --start-blend-steps 3 --rtc-max-guidance-weight 8
 ```
 
-下文为 SO-101 原项目文档。
+> ⚠️ `--episodes` 是**结束时的回合编号**，不是要跑的回合数。从 200 续跑 10 回合要写 210。
+
+## 按键
+
+| 按键 | 作用 |
+|---|---|
+| `p` | 摆位，摆好后再按一次 `p` 开始本回合 |
+| `a` | 训练就绪后，允许 Actor 在关键阶段接管 |
+| `c` | 手动切换关键阶段（优先于自动分类器） |
+| `h` | 人工接管 / 交还 |
+| `f` | 结束本回合，随后按 `y` 成功 / `n` 失败 / `d` 丢弃 |
+| `q` | 退出 |
+
+## 算法与控制
+
+### 接管与执行
+
+- 每回合由 VLA 开始执行。按 `a` 后，Actor 在关键阶段接管（分类器概率 ≥ 0.75 进入，≤ 0.45 退出，`c` 可手动切换）。
+- `h` 人工接管，接管期间的指令作为 BC 目标写入回放。
+- 异步 RTC 规划，30 Hz 下发指令。起步和人工交还时按 `--start-blend-steps` 过渡。夹爪独立执行，速度上限 0.30 m/s。
+
+### 训练
+
+- **Actor**：`−min(Q1, Q2) + 10 × BC MSE`。BC 目标在关键阶段为实际执行动作，人工接管时为人工指令。
+- **Critic**：双 Q，以控制器实际接受的动作和有效控制步的折扣回报做 TD 更新。
+- **更新比例**：Critic : Actor = 2 : 1。
+- **采样**：在线 30% warmup + 70% online/HIL；离线重训均匀采样。
+
+### 残差限幅
+
+以下数值均为分位数归一化后的值（q01 → −1，q99 → 1）。
+
+| 参数 | 约束 | 默认 |
+|---|---|---|
+| `--actor-residual-scale`（`s`） | Actor 相对 VLA 的偏移，每维 ≤ `s` | `0.05`（`rlt_stage2.json`） |
+| `--actor-residual-step`（`δ`） | 相邻 30 Hz 指令间偏移的变化 ≤ `δ` | `0`（关闭） |
+
+- **幅度**：`a = a_VLA + s · tanh(f(z_rl, state, a_VLA))`，输出层零初始化。`s = 0` 时 Actor 输出完整动作块。
+- **速率**：每个计划中，Actor 与 VLA 指令之差裁到 `±s` 后取均值，得到目标偏移 `g`。偏移从上一条已执行指令的值 `u₀` 以每步 `δ` 趋近 `g`：`u_k = u₀ + clip(g − u₀, −kδ, kδ)`。切回 VLA 时 `g = 0`，进入人工接管时偏移清零。启用后取代 `actor_handoff_steps` 的块间插值。
+- 在线执行、BC、Q 与 TD 目标共用同一动作变换（`ActionTimeline.prepare_policy`），限幅在训练中生效。
+
+## 参数与 checkpoint
+
+- 在线训练：`s` 在 `rlt_stage2.json` 中设置，`δ` 通过 `--actor-residual-step` 传入。离线重训两者均由命令行指定。
+- `s`、`δ` 保存在 checkpoint 中，`--resume-from` 时沿用；修改幅度用 `--resume-actor-residual-scale`。离线重训未指定 `--actor-residual-step` 时沿用源 checkpoint。
+- 残差 Actor（`s > 0`）与完整输出 Actor（`s = 0`）不兼容。启用 `δ` 的 Actor 只能通过 `./rlt stage2` 执行。
+
+## 与 SO-101 版本的区别
+
+| | ARX X5（本仓库） | SO-101（上游） |
+|---|---|---|
+| 入口 | `./rlt stage2 ...` | `python scripts/train_rlt_stage2_pi05.py` |
+| 配置 | `config.json` + `rlt_stage2.json` | `configs/stage2_pi05.json` |
+| 环境 | `setup_arx.sh`（`.venv`） | conda |
+| 丢弃回合 | `d` | `g` |
+| Actor 输出 | 有界残差（默认 `s = 0.05`），可选速率限制 | 默认完整输出（`actor_residual_scale = 0`） |
 
 ---
+
+## 附：SO-101 上游文档
 
 <h1 align="center">RL-Token-Pi05</h1>
 
